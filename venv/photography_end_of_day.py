@@ -9,6 +9,9 @@ import multiprocessing
 import queue
 import exiftool
 import datetime
+import shutil
+import pathlib
+import glob
 
 
 def _parse_args():
@@ -335,7 +338,7 @@ def _set_unique_destination_filename( source_file, file_data, program_options, f
     }
 
     # merge the date_component data into the file_data
-    file_data.update( date_components )
+    #file_data.update( date_components )
 
     year_subfolder = os.path.join( program_options['destination_root'], str(date_components['year']))
     year_date_subfolder = os.path.join( year_subfolder, date_components['date_iso8601'] )
@@ -349,7 +352,7 @@ def _set_unique_destination_filename( source_file, file_data, program_options, f
     if not year_date_subfolder in destination_dirs_scanned:
         if os.path.isdir( year_subfolder) is True and os.path.isdir( year_date_subfolder ) is True:
             # TODO: Enumerate all matching files in the directory
-            glob_match_str = os.path.join( year_date_subfolder, f"*{matching_file_extension}" )
+            glob_match_str = os.path.join( year_date_subfolder, f"*{program_options['file_extension']}" )
             #logging.debug( f"Glob match string: {glob_match_str}")
 
             files_matching_glob = glob.glob( glob_match_str )
@@ -425,6 +428,108 @@ def _set_destination_filenames( program_options, source_file_manifest ):
     }
 
 
+def _do_file_copies( program_options, source_file_manifest ):
+    start_time = time.perf_counter()
+
+    file_count = len( source_file_manifest.keys() )
+
+    for curr_source_file in source_file_manifest:
+        # print( f"Worker {worker_index} doing copy for {curr_source_file}" )
+        curr_file_entry = source_file_manifest[curr_source_file]
+
+        # Do we need to make either of the subfolders (YYYY/YYYY-MM-DD)?
+        curr_folder = curr_file_entry['destination_subfolders']['date']
+        try:
+            pathlib.Path(curr_folder).mkdir(parents=True, exist_ok=True)
+        except:
+            print(f"Exception thrown in creating dirs for {curr_folder}")
+
+        # Remove the destination subfolder section out of the manifest, it's no longer needed
+        del curr_file_entry['destination_subfolders']
+
+        # Attempt copy
+        try:
+            dest_path = curr_file_entry['unique_destination_file_path']
+            source_absolute_path = os.path.join( program_options['source_dirs'][0], curr_source_file)
+            shutil.copyfile(source_absolute_path, dest_path)
+            # print( f"\"{curr_source_file}\" -> \"{dest_path}\" - OK OK OK")
+
+        except:
+            print(f"Exception thrown when copying {curr_file_entry['file_path']}")
+
+    end_time = time.perf_counter()
+    operation_time_seconds = end_time - start_time
+
+    return {
+        "operation_time_seconds"    : operation_time_seconds,
+    }
+
+def _do_readback_validation( source_file_manifest ):
+    start_time = time.perf_counter()
+
+    process_handles = []
+
+    #  Queue for sending files needing validation  to children
+    files_to_verify_queue = multiprocessing.Queue()
+
+    # Event object that parent uses so children know when to stop reading
+    parent_done_writing = multiprocessing.Event()
+
+    for i in range(multiprocessing.cpu_count()):
+        process_handle = multiprocessing.Process( target=_validation_worker,
+                                                  args=(i+1, files_to_verify_queue, parent_done_writing) )
+        process_handle.start()
+        #logging.debug(f"Parent back from start on child process {i+1}")
+        process_handles.append( process_handle )
+
+    # Load up the queue with all the files to process
+    for curr_file in source_file_manifest:
+        curr_file_info = source_file_manifest[curr_file]
+        validation_worker_data = {
+            'file_path'         : curr_file_info['unique_destination_file_path'],
+            'filesize_bytes'    : curr_file_info['filesize_bytes'],
+            'hashes'            : curr_file_info['hashes'],
+        }
+        logging.debug(f"About to write {json.dumps(validation_worker_data)} to the child queue")
+        files_to_verify_queue.put(validation_worker_data)
+
+    parent_done_writing.set()
+
+    # Just wait until all child processes rejoin
+    while process_handles:
+        curr_process = process_handles.pop()
+        curr_process.join()
+
+    end_time = time.perf_counter()
+    operation_time_seconds = end_time - start_time
+
+    return {
+        "operation_time_seconds"    : operation_time_seconds,
+    }
+
+
+def _validation_worker( worker_index, files_to_verify_queue, parent_done_writing ):
+    while True:
+        try:
+            # No need to wait, the queue was pre-loaded by the parent
+            curr_file_entry = files_to_verify_queue.get(timeout=0.1)
+        except queue.Empty:
+            # is it because the parent is done writing?
+            if parent_done_writing.is_set():
+                break
+
+        #print( f"Child {worker_index} validating file {curr_file_entry['file_path']}")
+
+        with open( curr_file_entry['file_path'], "rb" ) as verify_file_handle:
+            file_bytes = verify_file_handle.read()
+            if hashlib.sha3_512(file_bytes).hexdigest() != curr_file_entry['hashes']['sha3_512']:
+                print( f"FATAL: file {curr_file_entry['file_path']} does not have expected hash from manifest")
+            else:
+                #print( f"{curr_file_entry['file_path']} passed its verify hash check")
+                pass
+
+    # Okay to just cleanly fall out and exit
+
 def _main():
     args = _parse_args()
     program_options = {}
@@ -467,20 +572,29 @@ def _main():
     _add_perf_timing( perf_timings, 'Generating Unique Destination Filenames',
                       set_destination_filenames_results['operation_time_seconds'] )
 
-
-
-    
-    print( json.dumps( source_file_manifest, indent=4, sort_keys=True, default=str))
-
     # Do file copies
+    print("\nFile copies starting")
+    copy_operation_results = _do_file_copies(program_options, source_file_manifest)
+    print("File copies completed")
+    _add_perf_timing(perf_timings, 'Copying RAW files to destination', copy_operation_results['operation_time_seconds'])
 
     # Do readback validation to make sure NAS writes worked
+    print("\nReading files back from destination to verify contents still match original hash")
+    verify_operation_results = _do_readback_validation( source_file_manifest )
+    _add_perf_timing(perf_timings, 'Validating all writes are still byte-identical to source',
+        verify_operation_results['operation_time_seconds'])
 
-    # Write manifest file to each output directory with the info for the files in that directory
+    # Flip the keys in file manifest from source relative to final destination path, as that's
+    #   now the only thing that's reasonable to index by. Remove "unique_destination_file_path"
 
     # Geotag images into XMP
 
     # Pull geotags out of XMP and put into manifest files? Maybe?
+
+    # Write manifest file to each output directory with the info for the files in that directory
+
+
+    #print( json.dumps( source_file_manifest, indent=4, sort_keys=True, default=str))
 
 
     # Final perf print
