@@ -12,6 +12,7 @@ import datetime
 import shutil
 import pathlib
 import glob
+import tempfile
 
 
 def _parse_args():
@@ -25,8 +26,9 @@ def _parse_args():
     arg_parser.add_argument("file_timestamp_utc_offset_hours",
                             help="Hours offset from UTC, e.g. EDT is -4, Afghanistan is +4.5",
                             type=float)
+    arg_parser.add_argument( "scratch_write_location", help="Root of scratch storage directory (almost certainly temp dir on NVMe SSD in laptop for max speed)")
     arg_parser.add_argument( "gpx_file_folder", help="Path to folder with all GPX files for these pictures")
-    arg_parser.add_argument( "destination_root", help="Root of destination directory (e.g., \"Q:\Lightroom\Images\")")
+
     return arg_parser.parse_args()
 
 
@@ -325,82 +327,53 @@ def _exif_timestamp_worker( child_process_index, files_to_process_queue, process
     #print( f"Child {child_process_index} exiting cleanly")
 
 
-def _set_unique_destination_filename( source_file, file_data, program_options, filename_conflict_dict,
-                                      destination_dirs_scanned ):
-    #logging.debug( f"Setting destination filename for {source_file} under {args.destination_root}")
-
+def _set_unique_destination_filename( source_file, file_data, program_options, destination_file_manifests ):
     # Folder structure is YYYY\YY-MM-DD\[unique filename]
-
     date_components = {
-        'year'          : file_data['timestamp'].year,
+        'year'          : str( file_data['timestamp'].year ),
+
+        # Can't we pull the date out of the timestmap and just ISO8601 this? I don't think we need to build our own
         'date_iso8601'  : \
             f"{file_data['timestamp'].year:4d}-{file_data['timestamp'].month:02d}-{file_data['timestamp'].day:02d}",
     }
 
-    # merge the date_component data into the file_data
-    #file_data.update( date_components )
+    if date_components['year'] not in destination_file_manifests:
+        destination_file_manifests[ date_components['year']] = {}
 
-    year_subfolder = os.path.join( program_options['destination_root'], str(date_components['year']))
-    year_date_subfolder = os.path.join( year_subfolder, date_components['date_iso8601'] )
+    if date_components['date_iso8601'] not in destination_file_manifests[ date_components['year'] ]:
+        destination_file_manifests[ date_components['year'] ][ date_components['date_iso8601']] = {}
 
-    file_data['destination_subfolders'] = {
-        'year': year_subfolder,
-        'date': year_date_subfolder,
-    }
+    file_data['destination_subfolder'] = os.path.join( date_components['year'], date_components['date_iso8601'] )
 
-    # Have we added existing files in this subfolder to the conflict_dict already?
-    if not year_date_subfolder in destination_dirs_scanned:
-        if os.path.isdir( year_subfolder) is True and os.path.isdir( year_date_subfolder ) is True:
-            # TODO: Enumerate all matching files in the directory
-            glob_match_str = os.path.join( year_date_subfolder, f"*{program_options['file_extension']}" )
-            #logging.debug( f"Glob match string: {glob_match_str}")
+    manifest_for_this_file = destination_file_manifests[ date_components['year'] ][ date_components['date_iso8601']]
 
-            files_matching_glob = glob.glob( glob_match_str )
-
-            # add any files in this dir
-            for curr_match in files_matching_glob:
-                filename_conflict_dict[curr_match] = None
-
-            #logging.debug( f"Added {len(files_matching_glob)} files from \"{year_date_subfolder}\" to conflict list")
-        else:
-            #logging.debug( f"Subfolder \"{year_date_subfolder}\" does not exist, added to list of dirs we have scanned" )
-            pass
-
-        # Regardless of which logic path we took, we can now say we've scanned that directory
-        destination_dirs_scanned[ year_date_subfolder ] = None
-    else:
-        #logging.debug( f"Already scanned directory \"{year_date_subfolder}\", skipping")
-        pass
-
-    # Find first filename that doesn't exist in conflict list
+    # Find first filename that doesn't exist in the given destination manifest
     basename = os.path.basename( source_file )
     (basename_minus_ext, file_extension) = os.path.splitext(basename)
 
-    test_file_path = os.path.join( year_date_subfolder, basename )
-    index_append = None
+    test_filename = basename
+    index_append = 0
 
-    while test_file_path in filename_conflict_dict:
+    while test_filename in manifest_for_this_file:
         # Need to come up with a non-conflicting name
-        if index_append is None:
-            index_append = 1
-        else:
-            index_append += 1
+        index_append += 1
 
-        next_attempt_name = os.path.join( year_date_subfolder,
-                                          basename_minus_ext + f"-{index_append:04d}" + file_extension )
+        next_attempt_name = f"{basename_minus_ext}_{index_append:04d}{file_extension}"
 
-        logging.info( f"Found destination filename conflict with \"{test_file_path}\", trying \"{next_attempt_name}\"" )
+        logging.info( f"Found destination filename conflict with \"{test_filename}\", trying \"{next_attempt_name}\"" )
 
-        test_file_path = next_attempt_name
+        test_filename = next_attempt_name
 
-    logging.debug( f"Found unique destination filename: {test_file_path}")
+    logging.debug( f"Found unique destination filename: {test_filename}")
     # Mark the final location for this file
-    file_data[ 'unique_destination_file_path' ] = test_file_path
+    file_data[ 'unique_destination_file_path' ] = os.path.join( date_components['year'],
+                                                                date_components['date_iso8601'],
+                                                                test_filename )
 
-    # Add final location to our conflict list
-    filename_conflict_dict[ test_file_path ] = None
+    # Update destination manifest
+    destination_file_manifests[ test_filename ] = file_data
 
-    logging.debug( f"Updated file info:\n{json.dumps(file_data, indent=4, sort_keys=True, default=str)}")
+    #logging.debug( f"Updated file info:\n{json.dumps(file_data, indent=4, sort_keys=True, default=str)}")
 
 
 def _set_destination_filenames( program_options, source_file_manifest ):
@@ -409,50 +382,53 @@ def _set_destination_filenames( program_options, source_file_manifest ):
 
     sorted_files = sorted(source_file_manifest.keys())
 
-    destination_filename_conflict_dict = {}
-    destination_dirs_scanned = {}
+    destination_file_manifests = {}
 
     for curr_file in sorted_files:
         logging.debug(f"Getting size and unique destination filename for {curr_file}")
         #logging.debug(f"\tSize: {file_size} bytes")
 
         _set_unique_destination_filename( curr_file, source_file_manifest[curr_file],
-            program_options, destination_filename_conflict_dict,
-            destination_dirs_scanned )
+            program_options, destination_file_manifests )
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
 
     return {
-        "operation_time_seconds"    : operation_time_seconds,
+        "operation_time_seconds"        : operation_time_seconds,
+        'destination_file_manifests'    : destination_file_manifests,
     }
 
 
-def _do_file_copies( program_options, source_file_manifest ):
+def _do_file_copies_to_scratch_write( program_options, source_file_manifest ):
     start_time = time.perf_counter()
 
     file_count = len( source_file_manifest.keys() )
+
+    # TODO: Create temp dir under scratch write folder
+    scratch_write_tempdir = tempfile.TemporaryDirectory(dir=program_options['scratch_write_location'])
+    print( f"\tCreated scratch write temp directory {scratch_write_tempdir.name}")
 
     for curr_source_file in source_file_manifest:
         # print( f"Worker {worker_index} doing copy for {curr_source_file}" )
         curr_file_entry = source_file_manifest[curr_source_file]
 
         # Do we need to make either of the subfolders (YYYY/YYYY-MM-DD)?
-        curr_folder = curr_file_entry['destination_subfolders']['date']
+        curr_folder = os.path.join( scratch_write_tempdir.name, curr_file_entry['destination_subfolder'] )
         try:
             pathlib.Path(curr_folder).mkdir(parents=True, exist_ok=True)
         except:
             print(f"Exception thrown in creating dirs for {curr_folder}")
 
         # Remove the destination subfolder section out of the manifest, it's no longer needed
-        del curr_file_entry['destination_subfolders']
+        del curr_file_entry['destination_subfolder']
 
         # Attempt copy
         try:
-            dest_path = curr_file_entry['unique_destination_file_path']
+            dest_path = os.path.join( scratch_write_tempdir.name, curr_file_entry['unique_destination_file_path'] )
             source_absolute_path = os.path.join( program_options['source_dirs'][0], curr_source_file)
             shutil.copyfile(source_absolute_path, dest_path)
-            # print( f"\"{curr_source_file}\" -> \"{dest_path}\" - OK OK OK")
+            print( f"\tCopied \"{source_absolute_path}\" -> \"{dest_path}\" successfully")
 
         except:
             print(f"Exception thrown when copying {curr_file_entry['file_path']}")
@@ -461,10 +437,12 @@ def _do_file_copies( program_options, source_file_manifest ):
     operation_time_seconds = end_time - start_time
 
     return {
-        "operation_time_seconds"    : operation_time_seconds,
+        "scratch_write_temp_directory"  : scratch_write_tempdir,
+        "operation_time_seconds"        : operation_time_seconds,
     }
 
-def _do_readback_validation( source_file_manifest ):
+
+def _do_readback_validation( source_file_manifest, scratch_write_tempdir ):
     start_time = time.perf_counter()
 
     process_handles = []
@@ -486,7 +464,8 @@ def _do_readback_validation( source_file_manifest ):
     for curr_file in source_file_manifest:
         curr_file_info = source_file_manifest[curr_file]
         validation_worker_data = {
-            'file_path'         : curr_file_info['unique_destination_file_path'],
+            'file_path'         : os.path.join( scratch_write_tempdir.name,
+                                                curr_file_info['unique_destination_file_path'] ),
             'filesize_bytes'    : curr_file_info['filesize_bytes'],
             'hashes'            : curr_file_info['hashes'],
         }
@@ -546,7 +525,7 @@ def _main():
     program_options['exiftool_path'] = args.exiftool
     program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
     program_options['gpx_file_folder'] = args.gpx_file_folder
-    program_options['destination_root'] = args.destination_root
+    program_options['scratch_write_location'] = args.scratch_write_location
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
@@ -569,32 +548,40 @@ def _main():
     # Determine unique filenames
     print( "\nDetermining unique filenames in destination folder")
     set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest )
-    _add_perf_timing( perf_timings, 'Generating Unique Destination Filenames',
+    _add_perf_timing( perf_timings, 'Generating unique destination filenames',
                       set_destination_filenames_results['operation_time_seconds'] )
 
-    # Do file copies
-    print("\nFile copies starting")
-    copy_operation_results = _do_file_copies(program_options, source_file_manifest)
-    print("File copies completed")
-    _add_perf_timing(perf_timings, 'Copying RAW files to destination', copy_operation_results['operation_time_seconds'])
+    # Do file copies to *scratch write* location (read: laptop NVMe SSD)
+    print("\nFile copies from camera storage media to scratch write location starting")
+    copy_operation_results = _do_file_copies_to_scratch_write(program_options, source_file_manifest)
+    print("\tFile copies completed")
+    _add_perf_timing(perf_timings, 'Copying RAW files to scratch write location',
+                     copy_operation_results['operation_time_seconds'])
+    scratch_write_tempdir = copy_operation_results['scratch_write_temp_directory']
 
-    # Do readback validation to make sure NAS writes worked
-    print("\nReading files back from destination to verify contents still match original hash")
-    verify_operation_results = _do_readback_validation( source_file_manifest )
-    _add_perf_timing(perf_timings, 'Validating all writes are still byte-identical to source',
+    # Do readback validation to make sure all writes to scratch area worked
+    print("\nReading files back from scratch write to verify contents still match original hash")
+    verify_operation_results = _do_readback_validation( source_file_manifest, scratch_write_tempdir )
+    _add_perf_timing(perf_timings, 'Validating all writes to fast scratch write storage are still byte-identical to source',
         verify_operation_results['operation_time_seconds'])
-
-    # Flip the keys in file manifest from source relative to final destination path, as that's
-    #   now the only thing that's reasonable to index by. Remove "unique_destination_file_path"
 
     # Geotag images into XMP
 
-    # Pull geotags out of XMP and put into manifest files? Maybe?
+    # Pull geotags out of XMP and store in manifest
 
-    # Write manifest file to each output directory with the info for the files in that directory
+    # Write manifest files to each date dir in scratch
 
+    # ZIP up the entire day in scratch storage (no compression!)
 
-    #print( json.dumps( source_file_manifest, indent=4, sort_keys=True, default=str))
+    # Take hashes of each ZIP file
+
+    # Do test unzip to scratch
+
+    # Compare files extracted from ZIP match hashes in manifest
+
+    # Do copy of known-good ZIP to each trip capacity storage device (e.g., SanDisk Extreme Pro V2 4TB SSD)
+
+    # Check hash of ZIP file on each trip capacity storage device
 
 
     # Final perf print
