@@ -7,6 +7,8 @@ import os
 import hashlib
 import multiprocessing
 import queue
+import exiftool
+import datetime
 
 
 def _parse_args():
@@ -15,7 +17,11 @@ def _parse_args():
     arg_parser.add_argument("--logfile", help="Path to file where the app log will be created",
                             default="photo_end_of_day.log" )
     arg_parser.add_argument( "--sourcedir", help="Path to a source directory", required=True, action="append" )
-    arg_parser.add_argument( "--fileext", help="File extension, e.g. \"NEF\", \"CR3\"", required=True )
+    arg_parser.add_argument( "fileext", help="File extension, e.g. \"NEF\", \"CR3\""  )
+    arg_parser.add_argument( "exiftool", help="Path to the exiftool utility" )
+    arg_parser.add_argument("file_timestamp_utc_offset_hours",
+                            help="Hours offset from UTC, e.g. EDT is -4, Afghanistan is +4.5",
+                            type=float)
     return arg_parser.parse_args()
 
 
@@ -115,7 +121,7 @@ def _generate_source_manifest( source_dirs_info ):
     # Event object that parent uses so children know when to exit
     parent_done_writing = multiprocessing.Event()
 
-    for i in range(1): # multiprocessing.cpu_count()):
+    for i in range(multiprocessing.cpu_count()):
         process_handle = multiprocessing.Process( target=_source_file_hash_worker,
                                                   args=(i+1, files_to_process_queue,
                                                         file_hashes_queue,
@@ -197,6 +203,124 @@ def _source_file_hash_worker( worker_index, source_file_queue, hash_queue, paren
             )
 
 
+def _get_exif_datetimes( program_options, source_image_manifest ):
+
+    time_start = time.perf_counter()
+
+    file_data = {}
+    source_image_files = sorted(source_image_manifest.keys())
+    file_count = len(source_image_files)
+
+    print( f"\nStarting EXIF timestamp extraction for {file_count} files")
+
+    start_time = time.perf_counter()
+
+    process_handles = []
+
+    #  Queue for sending files needing timestamps to children
+    files_to_process_queue = multiprocessing.Queue(maxsize=file_count)
+
+    # Queue that children use to write EXIF timestamp information data back to parent
+    processed_file_queue = multiprocessing.Queue(maxsize=file_count)
+
+    for i in range(multiprocessing.cpu_count()):
+        process_handle = multiprocessing.Process( target=_exif_timestamp_worker,
+                                                  args=(i+1, files_to_process_queue,
+                                                        processed_file_queue,
+                                                        program_options) )
+
+        process_handle.start()
+        #logging.debug(f"Parent back from start on child process {i+1}")
+        process_handles.append( process_handle )
+
+    # Load up the queue with all the files to process
+    for curr_file in source_image_files:
+        exif_worker_data = {
+            'paths'             : {
+                'absolute'          : os.path.join(program_options['source_dirs'][0], curr_file ),
+                'relative'          : curr_file,
+            },
+            'manifest_data'     : source_image_manifest[curr_file],
+        }
+        logging.debug(f"About to write {json.dumps(exif_worker_data)} to the child queue")
+        files_to_process_queue.put(exif_worker_data)
+
+    # We know how many files we wrote into the queue that children read out of. Now read
+    #   same number of entries out of the processed data queue
+    for i in range( file_count ):
+        exif_timestamp_data = processed_file_queue.get()
+        source_image_manifest[ exif_timestamp_data['paths']['relative']]['timestamp'] = \
+                exif_timestamp_data['timestamp']
+
+    #logging.debug( f"Parent process has read out all {file_count} entries from results queue" )
+
+    # Rejoin child threads
+    while process_handles:
+        curr_handle = process_handles.pop()
+        #logging.debug("parent process waiting for child worker to rejoin")
+        curr_handle.join()
+        #logging.debug("child process has rejoined cleanly")
+
+    #logging.debug("Parent process exiting, all EXIF timestamp work done")
+
+    time_end = time.perf_counter()
+
+    operation_time_seconds = time_end - time_start
+
+    print( f"Completed EXIF timestamps extraction")
+
+    return {
+        'operation_time_seconds'    : operation_time_seconds,
+    }
+
+
+def _exif_timestamp_worker( child_process_index, files_to_process_queue, processed_file_queue, program_options ):
+    #print( f"Child {child_process_index} started")
+
+    exiftool_tag_name = "EXIF:DateTimeOriginal"
+
+    with exiftool.ExifTool(program_options['exiftool_path']) as exiftool_handle:
+
+        while True:
+            try:
+                # No need to wait, the queue was pre-loaded by the parent
+                curr_file_entry = files_to_process_queue.get( timeout=0.1 )
+            except queue.Empty:
+                # no more work to be done
+                #print( f"Child {child_process_index} found queue empty on get, bailing from processing loop")
+                break
+
+            print( f"Child {child_process_index} read processing entry from queue: " +
+                   json.dumps(curr_file_entry, indent=4, sort_keys=True) )
+
+
+            absolute_path = curr_file_entry['paths']['absolute']
+
+            exif_datetime = exiftool_handle.get_tag(exiftool_tag_name, absolute_path)
+
+            # Create legit datetime object from string, note: not tz aware (yet)
+            file_datetime_no_tz = datetime.datetime.strptime(exif_datetime, "%Y:%m:%d %H:%M:%S")
+
+            # Do hour shift from timezone-unaware EXIF datetime to UTC
+            shifted_datetime_no_tz = file_datetime_no_tz + datetime.timedelta(
+                hours=-(program_options['file_timestamp_utc_offset_hours']))
+
+            # Create TZ-aware datetime, as one should basically always strive to use
+            file_datetime_utc = shifted_datetime_no_tz.replace(tzinfo=datetime.timezone.utc)
+
+            processed_file_queue.put(
+                {
+                    'paths': {
+                        'relative': curr_file_entry['paths']['relative'],
+                    },
+                    'timestamp': file_datetime_utc.isoformat(),
+                }
+            )
+
+
+    #print( f"Child {child_process_index} exiting cleanly")
+
+
 def _main():
     args = _parse_args()
     program_options = {}
@@ -210,6 +334,8 @@ def _main():
 
     program_options['source_dirs'] = args.sourcedir
     program_options['file_extension'] = args.fileext.lower()
+    program_options['exiftool_path'] = args.exiftool
+    program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
@@ -223,11 +349,13 @@ def _main():
 
     manifest_info = _generate_source_manifest(source_image_info['source_dirs'])
     _add_perf_timing(perf_timings, 'Creating source image manifest', manifest_info['operation_time_seconds'])
-    #logging.debug( json.dumps( manifest_info['source_manifest'], sort_keys=True, indent=4) )
+    source_file_manifest = manifest_info['source_manifest']
 
-    # If there are two source dirs, they have to be identical
+    # Find EXIF dates for all source image files
+    datetime_extraction_output = _get_exif_datetimes( program_options, source_file_manifest )
+    _add_perf_timing( perf_timings, 'Obtaining EXIF Timestamps', datetime_extraction_output['operation_time_seconds'])
+    print( json.dumps( source_file_manifest, indent=4, sort_keys=True, default=str))
 
-    #logging.debug( json.dumps(source_image_info, indent=4, sort_keys=True))
 
     # Final perf print
     _display_perf_timings( perf_timings )
