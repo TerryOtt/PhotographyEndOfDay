@@ -22,6 +22,8 @@ def _parse_args():
     arg_parser.add_argument("file_timestamp_utc_offset_hours",
                             help="Hours offset from UTC, e.g. EDT is -4, Afghanistan is +4.5",
                             type=float)
+    arg_parser.add_argument( "gpx_file_folder", help="Path to folder with all GPX files for these pictures")
+    arg_parser.add_argument( "destination_root", help="Root of destination directory (e.g., \"Q:\Lightroom\Images\")")
     return arg_parser.parse_args()
 
 
@@ -203,7 +205,7 @@ def _source_file_hash_worker( worker_index, source_file_queue, hash_queue, paren
             )
 
 
-def _get_exif_datetimes( program_options, source_image_manifest ):
+def _extract_image_timestamps( program_options, source_image_manifest ):
 
     time_start = time.perf_counter()
 
@@ -267,8 +269,6 @@ def _get_exif_datetimes( program_options, source_image_manifest ):
 
     operation_time_seconds = time_end - time_start
 
-    print( f"Completed EXIF timestamps extraction")
-
     return {
         'operation_time_seconds'    : operation_time_seconds,
     }
@@ -290,9 +290,8 @@ def _exif_timestamp_worker( child_process_index, files_to_process_queue, process
                 #print( f"Child {child_process_index} found queue empty on get, bailing from processing loop")
                 break
 
-            print( f"Child {child_process_index} read processing entry from queue: " +
-                   json.dumps(curr_file_entry, indent=4, sort_keys=True) )
-
+            #print( f"Child {child_process_index} read processing entry from queue: " +
+            #    json.dumps(curr_file_entry, indent=4, sort_keys=True) )
 
             absolute_path = curr_file_entry['paths']['absolute']
 
@@ -308,17 +307,122 @@ def _exif_timestamp_worker( child_process_index, files_to_process_queue, process
             # Create TZ-aware datetime, as one should basically always strive to use
             file_datetime_utc = shifted_datetime_no_tz.replace(tzinfo=datetime.timezone.utc)
 
+            # Create an
+
             processed_file_queue.put(
                 {
                     'paths': {
                         'relative': curr_file_entry['paths']['relative'],
                     },
-                    'timestamp': file_datetime_utc.isoformat(),
+                    'timestamp': file_datetime_utc,
                 }
             )
 
 
     #print( f"Child {child_process_index} exiting cleanly")
+
+
+def _set_unique_destination_filename( source_file, file_data, program_options, filename_conflict_dict,
+                                      destination_dirs_scanned ):
+    #logging.debug( f"Setting destination filename for {source_file} under {args.destination_root}")
+
+    # Folder structure is YYYY\YY-MM-DD\[unique filename]
+
+    date_components = {
+        'year'          : file_data['timestamp'].year,
+        'date_iso8601'  : \
+            f"{file_data['timestamp'].year:4d}-{file_data['timestamp'].month:02d}-{file_data['timestamp'].day:02d}",
+    }
+
+    # merge the date_component data into the file_data
+    file_data.update( date_components )
+
+    year_subfolder = os.path.join( program_options['destination_root'], str(date_components['year']))
+    year_date_subfolder = os.path.join( year_subfolder, date_components['date_iso8601'] )
+
+    file_data['destination_subfolders'] = {
+        'year': year_subfolder,
+        'date': year_date_subfolder,
+    }
+
+    # Have we added existing files in this subfolder to the conflict_dict already?
+    if not year_date_subfolder in destination_dirs_scanned:
+        if os.path.isdir( year_subfolder) is True and os.path.isdir( year_date_subfolder ) is True:
+            # TODO: Enumerate all matching files in the directory
+            glob_match_str = os.path.join( year_date_subfolder, f"*{matching_file_extension}" )
+            #logging.debug( f"Glob match string: {glob_match_str}")
+
+            files_matching_glob = glob.glob( glob_match_str )
+
+            # add any files in this dir
+            for curr_match in files_matching_glob:
+                filename_conflict_dict[curr_match] = None
+
+            #logging.debug( f"Added {len(files_matching_glob)} files from \"{year_date_subfolder}\" to conflict list")
+        else:
+            #logging.debug( f"Subfolder \"{year_date_subfolder}\" does not exist, added to list of dirs we have scanned" )
+            pass
+
+        # Regardless of which logic path we took, we can now say we've scanned that directory
+        destination_dirs_scanned[ year_date_subfolder ] = None
+    else:
+        #logging.debug( f"Already scanned directory \"{year_date_subfolder}\", skipping")
+        pass
+
+    # Find first filename that doesn't exist in conflict list
+    basename = os.path.basename( source_file )
+    (basename_minus_ext, file_extension) = os.path.splitext(basename)
+
+    test_file_path = os.path.join( year_date_subfolder, basename )
+    index_append = None
+
+    while test_file_path in filename_conflict_dict:
+        # Need to come up with a non-conflicting name
+        if index_append is None:
+            index_append = 1
+        else:
+            index_append += 1
+
+        next_attempt_name = os.path.join( year_date_subfolder,
+                                          basename_minus_ext + f"-{index_append:04d}" + file_extension )
+
+        logging.info( f"Found destination filename conflict with \"{test_file_path}\", trying \"{next_attempt_name}\"" )
+
+        test_file_path = next_attempt_name
+
+    logging.debug( f"Found unique destination filename: {test_file_path}")
+    # Mark the final location for this file
+    file_data[ 'unique_destination_file_path' ] = test_file_path
+
+    # Add final location to our conflict list
+    filename_conflict_dict[ test_file_path ] = None
+
+    logging.debug( f"Updated file info:\n{json.dumps(file_data, indent=4, sort_keys=True, default=str)}")
+
+
+def _set_destination_filenames( program_options, source_file_manifest ):
+
+    start_time = time.perf_counter()
+
+    sorted_files = sorted(source_file_manifest.keys())
+
+    destination_filename_conflict_dict = {}
+    destination_dirs_scanned = {}
+
+    for curr_file in sorted_files:
+        logging.debug(f"Getting size and unique destination filename for {curr_file}")
+        #logging.debug(f"\tSize: {file_size} bytes")
+
+        _set_unique_destination_filename( curr_file, source_file_manifest[curr_file],
+            program_options, destination_filename_conflict_dict,
+            destination_dirs_scanned )
+
+    end_time = time.perf_counter()
+    operation_time_seconds = end_time - start_time
+
+    return {
+        "operation_time_seconds"    : operation_time_seconds,
+    }
 
 
 def _main():
@@ -336,6 +440,8 @@ def _main():
     program_options['file_extension'] = args.fileext.lower()
     program_options['exiftool_path'] = args.exiftool
     program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
+    program_options['gpx_file_folder'] = args.gpx_file_folder
+    program_options['destination_root'] = args.destination_root
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
@@ -351,10 +457,30 @@ def _main():
     _add_perf_timing(perf_timings, 'Creating source image manifest', manifest_info['operation_time_seconds'])
     source_file_manifest = manifest_info['source_manifest']
 
-    # Find EXIF dates for all source image files
-    datetime_extraction_output = _get_exif_datetimes( program_options, source_file_manifest )
-    _add_perf_timing( perf_timings, 'Obtaining EXIF Timestamps', datetime_extraction_output['operation_time_seconds'])
+    # Get timestamp for all image files
+    timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
+    _add_perf_timing( perf_timings, 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
+
+    # Determine unique filenames
+    print( "\nDetermining unique filenames in destination folder")
+    set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest )
+    _add_perf_timing( perf_timings, 'Generating Unique Destination Filenames',
+                      set_destination_filenames_results['operation_time_seconds'] )
+
+
+
+    
     print( json.dumps( source_file_manifest, indent=4, sort_keys=True, default=str))
+
+    # Do file copies
+
+    # Do readback validation to make sure NAS writes worked
+
+    # Write manifest file to each output directory with the info for the files in that directory
+
+    # Geotag images into XMP
+
+    # Pull geotags out of XMP and put into manifest files? Maybe?
 
 
     # Final perf print
