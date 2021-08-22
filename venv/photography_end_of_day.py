@@ -371,7 +371,10 @@ def _set_unique_destination_filename( source_file, file_data, program_options, d
                                                                 test_filename )
 
     # Update destination manifest
-    destination_file_manifests[ test_filename ] = file_data
+    manifest_for_this_file[ test_filename ] = file_data
+    # Replace the timestamp object with a ISO format string
+    manifest_for_this_file[ test_filename ][ 'timestamp'] = \
+        manifest_for_this_file[ test_filename ][ 'timestamp'].isoformat()
 
     #logging.debug( f"Updated file info:\n{json.dumps(file_data, indent=4, sort_keys=True, default=str)}")
 
@@ -428,7 +431,7 @@ def _do_file_copies_to_scratch_write( program_options, source_file_manifest ):
             dest_path = os.path.join( scratch_write_tempdir.name, curr_file_entry['unique_destination_file_path'] )
             source_absolute_path = os.path.join( program_options['source_dirs'][0], curr_source_file)
             shutil.copyfile(source_absolute_path, dest_path)
-            print( f"\tCopied \"{source_absolute_path}\" -> \"{dest_path}\" successfully")
+            #print( f"\tCopied \"{source_absolute_path}\" -> \"{dest_path}\" successfully")
 
         except:
             print(f"Exception thrown when copying {curr_file_entry['file_path']}")
@@ -509,6 +512,142 @@ def _validation_worker( worker_index, files_to_verify_queue, parent_done_writing
 
     # Okay to just cleanly fall out and exit
 
+
+def _geotag_images( destination_file_manifests, scratch_write_tempdir, program_options ):
+    start_time = time.perf_counter()
+
+    #  Queue for sending files needing geotagging to children
+    files_to_geotag_queue = multiprocessing.Queue()
+
+    # Queue that children use to write geotag information data back to parent
+    geotagged_images_queue = multiprocessing.Queue()
+
+    parent_done_writing = multiprocessing.Event()
+
+    #print( f"Destination manifests: {json.dumps(destination_file_manifests, indent=4, sort_keys=True, default=str)}" )
+
+    images_written_to_queue = 0
+
+    for curr_year_folder in sorted( destination_file_manifests ):
+        for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
+            curr_manifest = destination_file_manifests[ curr_year_folder ][ curr_date_folder ]
+            #print( f"Processing manifest for {curr_date_folder}" )
+            for curr_manifest_filename in sorted( curr_manifest ):
+                files_to_geotag_queue.put(
+                    {
+                        'year'              : curr_year_folder,
+                        'date'              : curr_date_folder,
+                        'filename'          : curr_manifest_filename,
+                        'geotag_info'       : curr_manifest[curr_manifest_filename],
+                    }
+                )
+                images_written_to_queue += 1
+
+                break
+            break
+        break
+
+    parent_done_writing.set()
+
+    _geotag_worker( 1, files_to_geotag_queue, geotagged_images_queue, scratch_write_tempdir,
+                    parent_done_writing, program_options )
+
+    items_read_from_geotag_queue = 0
+    while items_read_from_geotag_queue < images_written_to_queue:
+        geotag_results = geotagged_images_queue.get()
+        print( "Got geotag results from child:\n" + json.dumps(geotag_results, indent=4, sort_keys=True, default=str))
+        items_read_from_geotag_queue += 1
+
+    # Wait for all children to join
+
+    end_time = time.perf_counter()
+    operation_time_seconds = end_time - start_time
+
+    return {
+        "operation_time_seconds"    : operation_time_seconds,
+    }
+
+
+    # TODO: farm this work out to a child process
+
+    process_handles = []
+
+
+def _geotag_worker( worker_index, files_to_geotag_queue, geotagged_images_queue, scratch_write_tempdir,
+        parent_done_writing, program_options ):
+
+    with exiftool.ExifTool(program_options['exiftool_path']) as exiftool_handle:
+
+        while True:
+            try:
+                # No need to wait, the queue was pre-loaded by the parent
+                curr_image_to_geotag = files_to_geotag_queue.get( timeout=0.1 )
+            except queue.Empty:
+                if parent_done_writing.is_set():
+                    break
+
+            print( "Child asked to geotag:\n" + json.dumps( curr_image_to_geotag, indent=4, sort_keys=True,
+                                                            default=str))
+
+            raw_file_absolute_path = os.path.join(scratch_write_tempdir.name,
+                                                  curr_image_to_geotag['geotag_info']['unique_destination_file_path'] )
+
+            # Finally got what looks like a sane XMP with:
+            # "c:\Program Files (x86)\ExifTool\exiftool.exe" -geotag utah.gpx "-geotime<${DateTimeOriginal}-08:00" 694A0001.CR3 -o %d%f.xmp
+
+            # Had to do -8:00 because we took it in -0600 but I had the clock set two hours behind because 24 hour clock math is hard
+
+            # Generated XMP
+            # <?xpacket begin='﻿' id='W5M0MpCehiHzreSzNTczkc9d'?>
+            # <x:xmpmeta xmlns:x='adobe:ns:meta/' x:xmptk='Image::ExifTool 12.30'>
+            # <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            #
+            #  <rdf:Description rdf:about=''
+            #   xmlns:exif='http://ns.adobe.com/exif/1.0/'>
+            #   <exif:GPSAltitude>128147/100</exif:GPSAltitude>
+            #   <exif:GPSAltitudeRef>0</exif:GPSAltitudeRef>
+            #   <exif:GPSLatitude>41,3.772866N</exif:GPSLatitude>
+            #   <exif:GPSLongitude>112,14.433294W</exif:GPSLongitude>
+            #  </rdf:Description>
+            # </rdf:RDF>
+            # </x:xmpmeta>
+            # <?xpacket end='w'?>
+
+            # Looks like it lines up with the Lightroom one. Some differences, but close enough for gov't work
+
+            # Now need to see how to get Exiftool to take wildcards (or if we have to pass multiple -geotag options)
+
+            # Also need to figure out how to pass geotime
+
+            # THis worked for geotime
+            # "c:\Program Files (x86)\ExifTool\exiftool.exe" -geotag utah.gpx -geotime="2021:08:07 01:25:01+00:00" 694A0001.CR3 -o %d%f.xmp
+
+            exiftool_parameters = (
+                "-geotag",
+                os.path.join( program_options['gpx_file_folder'], "*.gpx" ),
+                "geotime",
+                curr_image_to_geotag['geotag_info']['timestamp'],
+                raw_file_absolute_path,
+            )
+
+            print( "exiftool parameters: " + json.dumps(exiftool_parameters, indent=4, sort_keys=True))
+
+            #exiftool_handle.execute_json( )
+
+            geotag_results = {
+                curr_image_to_geotag['year']: {
+                    curr_image_to_geotag['date']: {
+                        curr_image_to_geotag['filename']: curr_image_to_geotag['geotag_info']
+                    },
+                },
+            }
+
+            geotagged_images_queue.put( geotag_results )
+
+    print( "Child exiting cleanly")
+
+
+
 def _main():
     args = _parse_args()
     program_options = {}
@@ -550,6 +689,7 @@ def _main():
     set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest )
     _add_perf_timing( perf_timings, 'Generating unique destination filenames',
                       set_destination_filenames_results['operation_time_seconds'] )
+    destination_file_manifests = set_destination_filenames_results['destination_file_manifests']
 
     # Do file copies to *scratch write* location (read: laptop NVMe SSD)
     print("\nFile copies from camera storage media to scratch write location starting")
@@ -562,10 +702,16 @@ def _main():
     # Do readback validation to make sure all writes to scratch area worked
     print("\nReading files back from scratch write to verify contents still match original hash")
     verify_operation_results = _do_readback_validation( source_file_manifest, scratch_write_tempdir )
+    print( "\tDone")
     _add_perf_timing(perf_timings, 'Validating all writes to fast scratch write storage are still byte-identical to source',
         verify_operation_results['operation_time_seconds'])
 
-    # Geotag images into XMP
+    # Geotag images into XMP sidecar files
+    print("\nGeotagging RAW images using XMP sidecar files")
+    geotag_results = _geotag_images( destination_file_manifests, scratch_write_tempdir, program_options )
+    print( "\tDone")
+    _add_perf_timing(perf_timings, 'Geotagging images', geotag_results['operation_time_seconds'])
+
 
     # Pull geotags out of XMP and store in manifest
 
