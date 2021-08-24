@@ -13,6 +13,8 @@ import shutil
 import pathlib
 import glob
 import tempfile
+import zipfile
+import performance_timer
 
 
 def _parse_args():
@@ -26,20 +28,10 @@ def _parse_args():
     arg_parser.add_argument("file_timestamp_utc_offset_hours",
                             help="Hours offset from UTC, e.g. EDT is -4, Afghanistan is +4.5",
                             type=float)
-    arg_parser.add_argument( "scratch_write_location", help="Root of scratch storage directory (almost certainly temp dir on NVMe SSD in laptop for max speed)")
     arg_parser.add_argument( "gpx_file_folder", help="Path to folder with all GPX files for these pictures")
+    arg_parser.add_argument( "laptop_destination_folder", help="Path to storage folder on laptop NVMe" )
 
     return arg_parser.parse_args()
-
-
-def _add_perf_timing(perf_timings, label, value):
-    perf_timings['entries'].append(
-        {
-            'label' : label,
-            'value' : value,
-        }
-    )
-    perf_timings['total'] += value
 
 
 def _enumerate_source_images(program_options):
@@ -49,9 +41,11 @@ def _enumerate_source_images(program_options):
 
     print( "\nEnumerating source images")
 
+    total_file_count = 0
+
     for curr_source_dir in program_options['source_dirs']:
         print( f"\tScanning \"{curr_source_dir}\" for RAW image files with extension " +
-            f"\"{program_options['file_extension']}\"")
+            f".\"{program_options['file_extension']}\"")
 
         image_files = []
         cumulative_bytes = 0
@@ -82,33 +76,19 @@ def _enumerate_source_images(program_options):
             'cumulative_size'   : cumulative_bytes,
         }
 
+        total_file_count += len( image_files )
+
     end_time = time.perf_counter()
 
     operation_time_seconds = end_time - start_time
     #logging.debug( f"Enumerate time: {(operation_time_seconds):.03f} seconds" )
 
+    print ( f"\tFound {total_file_count} .{program_options['file_extension']} files")
+
     return {
         'source_dirs'               : files_by_source_dir,
         'operation_time_seconds'    : operation_time_seconds,
     }
-
-
-def _display_perf_timings( perf_timings ):
-    # Find longest label
-    longest_label_len = len('Total')
-    for entry in perf_timings['entries']:
-        if len(entry['label']) > longest_label_len:
-            longest_label_len = len(entry['label'])
-
-    print( "\nPerformance data:\n" )
-
-    for curr_entry in perf_timings['entries']:
-        percentage_time = (curr_entry['value'] / perf_timings['total']) * 100.0
-        print( f"\t{curr_entry['label']:>{longest_label_len}s} : {curr_entry['value']:>7.03f} seconds " +
-               f"({percentage_time:5.01f}%)")
-
-    total_label = "Total"
-    print (f"\n\t{total_label:>{longest_label_len}s} : {perf_timings['total']:>7.03f} seconds" )
 
 
 def _generate_source_manifest( source_dirs_info ):
@@ -180,6 +160,8 @@ def _generate_source_manifest( source_dirs_info ):
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
 
+    print (f"\tSource manifest created for all {file_count} image files")
+
     return {
         "operation_time_seconds"    : operation_time_seconds,
         "source_manifest"           : source_manifests[list(source_dirs_info.keys())[0]],
@@ -218,7 +200,7 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
     source_image_files = sorted(source_image_manifest.keys())
     file_count = len(source_image_files)
 
-    print( f"\nStarting EXIF timestamp extraction for {file_count} files")
+    print( f"\nExtracting EXIF timestamps from source images")
 
     start_time = time.perf_counter()
 
@@ -274,6 +256,8 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
 
     operation_time_seconds = time_end - time_start
 
+    print( f"\tCompleted for {file_count} source image files")
+
     return {
         'operation_time_seconds'    : operation_time_seconds,
     }
@@ -327,7 +311,67 @@ def _exif_timestamp_worker( child_process_index, files_to_process_queue, process
     #print( f"Child {child_process_index} exiting cleanly")
 
 
-def _set_unique_destination_filename( source_file, file_data, program_options, destination_file_manifests ):
+def _get_existing_files_in_destination( source_file_manifest, program_options ):
+
+    time_start = time.perf_counter()
+
+    print( f"\nStarting search for existing .{program_options['file_extension']} files under " +
+           f"{program_options['laptop_destination_folder']}")
+
+    existing_files = {}
+
+    total_existing_file_count = 0
+
+    # Get all the year/date combos in the source_file_manifest
+    for curr_source_file_manifest_file in source_file_manifest:
+        curr_source_file_manifest_entry = source_file_manifest[curr_source_file_manifest_file]
+
+        #print( f"Source file entry for {curr_source_file_manifest_file}:\n" + json.dumps(curr_source_file_manifest_entry, indent=4, sort_keys=True, default=str))
+
+        curr_year = curr_source_file_manifest_entry['timestamp'].year
+        year_str = str(curr_year)
+        curr_month = curr_source_file_manifest_entry['timestamp'].month
+        curr_day = curr_source_file_manifest_entry['timestamp'].day
+
+        date_string = f"{curr_year:04d}-{curr_month:02d}-{curr_day:02d}"
+
+
+        if year_str not in existing_files:
+            existing_files[year_str] = {}
+
+            if date_string not in existing_files[year_str]:
+                existing_files[year_str][date_string] = {}
+
+                #print( f"Folder to search: {folder_to_search}")
+                folder_to_search = os.path.join(program_options['laptop_destination_folder'],
+                                                year_str,
+                                                date_string)
+
+                if os.path.exists( folder_to_search ) and os.path.isdir( folder_to_search):
+
+                    matching_files = glob.glob( os.path.join( folder_to_search, f"*.{program_options['file_extension']}"))
+
+                    total_existing_file_count += len( matching_files )
+
+                    for curr_match in matching_files:
+                        existing_files[year_str][date_string][curr_match] = None
+
+                    print( f"\tAdded {len(matching_files)} .{program_options['file_extension']} files from {folder_to_search}")
+
+    time_end = time.perf_counter()
+    operation_time_seconds = time_end - time_start
+
+    print( f"\tFound total of {total_existing_file_count} pre-existing .{program_options['file_extension']} files")
+
+    return {
+        'operation_time_seconds'    : operation_time_seconds,
+        'existing_files'            : existing_files,
+    }
+
+
+
+def _set_unique_destination_filename( source_file, file_data, program_options, existing_destination_files,
+                                      destination_file_manifests ):
     # Folder structure is YYYY\YY-MM-DD\[unique filename]
     date_components = {
         'year'          : str( file_data['timestamp'].year ),
@@ -346,6 +390,7 @@ def _set_unique_destination_filename( source_file, file_data, program_options, d
     file_data['destination_subfolder'] = os.path.join( date_components['year'], date_components['date_iso8601'] )
 
     manifest_for_this_file = destination_file_manifests[ date_components['year'] ][ date_components['date_iso8601']]
+    existing_destination_files_in_dir = existing_destination_files[ date_components['year'] ][ date_components['date_iso8601']]
 
     # Find first filename that doesn't exist in the given destination manifest
     basename = os.path.basename( source_file )
@@ -354,7 +399,8 @@ def _set_unique_destination_filename( source_file, file_data, program_options, d
     test_filename = basename
     index_append = 0
 
-    while test_filename in manifest_for_this_file:
+    # If there is a pre-existing file with that name, or we're planning on creating a file with that name, find one that doesn't exist
+    while test_filename in existing_destination_files_in_dir or test_filename in manifest_for_this_file:
         # Need to come up with a non-conflicting name
         index_append += 1
 
@@ -373,13 +419,15 @@ def _set_unique_destination_filename( source_file, file_data, program_options, d
     # Update destination manifest
     manifest_for_this_file[ test_filename ] = file_data
     # Replace the timestamp object with a ISO format string
-    manifest_for_this_file[ test_filename ][ 'timestamp'] = \
-        manifest_for_this_file[ test_filename ][ 'timestamp'].isoformat()
+    #manifest_for_this_file[ test_filename ][ 'timestamp'] = \
+        #manifest_for_this_file[ test_filename ][ 'timestamp'].isoformat()
 
     #logging.debug( f"Updated file info:\n{json.dumps(file_data, indent=4, sort_keys=True, default=str)}")
 
 
-def _set_destination_filenames( program_options, source_file_manifest ):
+def _set_destination_filenames( program_options, source_file_manifest, existing_destination_files ):
+
+    print( "\nDetermining unique filenames in destination folder")
 
     start_time = time.perf_counter()
 
@@ -392,10 +440,12 @@ def _set_destination_filenames( program_options, source_file_manifest ):
         #logging.debug(f"\tSize: {file_size} bytes")
 
         _set_unique_destination_filename( curr_file, source_file_manifest[curr_file],
-            program_options, destination_file_manifests )
+            program_options, existing_destination_files, destination_file_manifests )
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
+
+    print( f"\tUnique filenames set for all {len(sorted_files)} destination image files" )
 
     return {
         "operation_time_seconds"        : operation_time_seconds,
@@ -403,21 +453,20 @@ def _set_destination_filenames( program_options, source_file_manifest ):
     }
 
 
-def _do_file_copies_to_scratch_write( program_options, source_file_manifest ):
+def _do_file_copies_to_laptop( program_options, source_file_manifest ):
+
+    print( f"\nCopying files from source \"{program_options['source_dirs'][0]}\" to destination \"{program_options['laptop_destination_folder']}\"")
+
     start_time = time.perf_counter()
 
     file_count = len( source_file_manifest.keys() )
-
-    # TODO: Create temp dir under scratch write folder
-    scratch_write_tempdir = tempfile.TemporaryDirectory(dir=program_options['scratch_write_location'])
-    print( f"\tCreated scratch write temp directory {scratch_write_tempdir.name}")
 
     for curr_source_file in source_file_manifest:
         # print( f"Worker {worker_index} doing copy for {curr_source_file}" )
         curr_file_entry = source_file_manifest[curr_source_file]
 
         # Do we need to make either of the subfolders (YYYY/YYYY-MM-DD)?
-        curr_folder = os.path.join( scratch_write_tempdir.name, curr_file_entry['destination_subfolder'] )
+        curr_folder = os.path.join( program_options['laptop_destination_folder'], curr_file_entry['destination_subfolder'] )
         try:
             pathlib.Path(curr_folder).mkdir(parents=True, exist_ok=True)
         except:
@@ -428,7 +477,7 @@ def _do_file_copies_to_scratch_write( program_options, source_file_manifest ):
 
         # Attempt copy
         try:
-            dest_path = os.path.join( scratch_write_tempdir.name, curr_file_entry['unique_destination_file_path'] )
+            dest_path = os.path.join( program_options['laptop_destination_folder'], curr_file_entry['unique_destination_file_path'] )
             source_absolute_path = os.path.join( program_options['source_dirs'][0], curr_source_file)
             shutil.copyfile(source_absolute_path, dest_path)
             #print( f"\tCopied \"{source_absolute_path}\" -> \"{dest_path}\" successfully")
@@ -439,13 +488,14 @@ def _do_file_copies_to_scratch_write( program_options, source_file_manifest ):
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
 
+    print( "\tFile copies completed")
+
     return {
-        "scratch_write_temp_directory"  : scratch_write_tempdir,
         "operation_time_seconds"        : operation_time_seconds,
     }
 
 
-def _do_readback_validation( source_file_manifest, scratch_write_tempdir ):
+def _do_readback_validation( source_file_manifest, program_options ):
     start_time = time.perf_counter()
 
     process_handles = []
@@ -467,7 +517,7 @@ def _do_readback_validation( source_file_manifest, scratch_write_tempdir ):
     for curr_file in source_file_manifest:
         curr_file_info = source_file_manifest[curr_file]
         validation_worker_data = {
-            'file_path'         : os.path.join( scratch_write_tempdir.name,
+            'file_path'         : os.path.join( program_options['laptop_destination_folder'],
                                                 curr_file_info['unique_destination_file_path'] ),
             'filesize_bytes'    : curr_file_info['filesize_bytes'],
             'hashes'            : curr_file_info['hashes'],
@@ -513,14 +563,11 @@ def _validation_worker( worker_index, files_to_verify_queue, parent_done_writing
     # Okay to just cleanly fall out and exit
 
 
-def _geotag_images( destination_file_manifests, scratch_write_tempdir, program_options ):
+def _create_xmp_files( destination_file_manifests, program_options ):
     start_time = time.perf_counter()
 
-    #  Queue for sending files needing geotagging to children
-    files_to_geotag_queue = multiprocessing.Queue()
-
-    # Queue that children use to write geotag information data back to parent
-    geotagged_images_queue = multiprocessing.Queue()
+    #  Queue for sending files needing XMP files children
+    xmp_file_queue = multiprocessing.Queue()
 
     parent_done_writing = multiprocessing.Event()
 
@@ -528,37 +575,38 @@ def _geotag_images( destination_file_manifests, scratch_write_tempdir, program_o
 
     images_written_to_queue = 0
 
+    process_handles = []
+
+    # Fire up the child processes
+    for i in range(multiprocessing.cpu_count()):
+        process_handle = multiprocessing.Process( target=_xmp_creation_worker,
+                                                  args=(i+1, xmp_file_queue, parent_done_writing, program_options ) )
+        process_handle.start()
+        #logging.debug(f"Parent back from start on child process {i+1}")
+        process_handles.append( process_handle )
+
     for curr_year_folder in sorted( destination_file_manifests ):
         for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
             curr_manifest = destination_file_manifests[ curr_year_folder ][ curr_date_folder ]
             #print( f"Processing manifest for {curr_date_folder}" )
             for curr_manifest_filename in sorted( curr_manifest ):
-                files_to_geotag_queue.put(
+                xmp_file_queue.put(
                     {
-                        'year'              : curr_year_folder,
-                        'date'              : curr_date_folder,
-                        'filename'          : curr_manifest_filename,
-                        'geotag_info'       : curr_manifest[curr_manifest_filename],
+                        'year'                  : curr_year_folder,
+                        'date'                  : curr_date_folder,
+                        'filename'              : curr_manifest_filename,
+                        'xmp_generation_info'   : curr_manifest[curr_manifest_filename],
                     }
                 )
                 images_written_to_queue += 1
 
-                break
-            break
-        break
-
     parent_done_writing.set()
 
-    _geotag_worker( 1, files_to_geotag_queue, geotagged_images_queue, scratch_write_tempdir,
-                    parent_done_writing, program_options )
 
-    items_read_from_geotag_queue = 0
-    while items_read_from_geotag_queue < images_written_to_queue:
-        geotag_results = geotagged_images_queue.get()
-        print( "Got geotag results from child:\n" + json.dumps(geotag_results, indent=4, sort_keys=True, default=str))
-        items_read_from_geotag_queue += 1
-
-    # Wait for all children to join
+    # Wait for all child processes to re-join with parent
+    while process_handles:
+        curr_handle = process_handles.pop()
+        curr_handle.join()
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -567,30 +615,40 @@ def _geotag_images( destination_file_manifests, scratch_write_tempdir, program_o
         "operation_time_seconds"    : operation_time_seconds,
     }
 
-
     # TODO: farm this work out to a child process
 
     process_handles = []
 
 
-def _geotag_worker( worker_index, files_to_geotag_queue, geotagged_images_queue, scratch_write_tempdir,
-        parent_done_writing, program_options ):
+def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_done_writing, program_options ):
 
     with exiftool.ExifTool(program_options['exiftool_path']) as exiftool_handle:
+
+        # Create geotag parameters as those won't change
+        geotag_parameters = []
 
         while True:
             try:
                 # No need to wait, the queue was pre-loaded by the parent
-                curr_image_to_geotag = files_to_geotag_queue.get( timeout=0.1 )
+                curr_image_to_create_xmp_for = files_to_create_xmp_files_queue.get( timeout=0.1 )
             except queue.Empty:
                 if parent_done_writing.is_set():
                     break
 
-            print( "Child asked to geotag:\n" + json.dumps( curr_image_to_geotag, indent=4, sort_keys=True,
-                                                            default=str))
+            #print( "Child asked to create XMP for:\n" + json.dumps( curr_image_to_create_xmp_for, indent=4, sort_keys=True,
+            #                                                default=str))
 
-            raw_file_absolute_path = os.path.join(scratch_write_tempdir.name,
-                                                  curr_image_to_geotag['geotag_info']['unique_destination_file_path'] )
+            raw_file_absolute_path = os.path.join(program_options['laptop_destination_folder'],
+                                                  curr_image_to_create_xmp_for['xmp_generation_info']['unique_destination_file_path'] )
+
+            (filename_no_extension, filename_extension) = os.path.splitext( raw_file_absolute_path )
+
+            expected_xmp_file = os.path.join( program_options['laptop_destination_folder'],
+                                              curr_image_to_create_xmp_for['year'],
+                                              curr_image_to_create_xmp_for['date'], f"{filename_no_extension}.xmp" )
+
+            # Yeah, geotagging with Exiftool is a nonstarter. Just too much hassle. I could do it at commandline,
+            #   But when trying to do with the pyexiftool wrapper it lacked GPS coords.  I give up.
 
             # Finally got what looks like a sane XMP with:
             # "c:\Program Files (x86)\ExifTool\exiftool.exe" -geotag utah.gpx "-geotime<${DateTimeOriginal}-08:00" 694A0001.CR3 -o %d%f.xmp
@@ -613,36 +671,21 @@ def _geotag_worker( worker_index, files_to_geotag_queue, geotagged_images_queue,
             # </x:xmpmeta>
             # <?xpacket end='w'?>
 
-            # Looks like it lines up with the Lightroom one. Some differences, but close enough for gov't work
+            exiftool_parameters= (
+                # Point it towards the RAW file we want an XMP file for
+                exiftool.fsencode(raw_file_absolute_path),
 
-            # Now need to see how to get Exiftool to take wildcards (or if we have to pass multiple -geotag options)
-
-            # Also need to figure out how to pass geotime
-
-            # THis worked for geotime
-            # "c:\Program Files (x86)\ExifTool\exiftool.exe" -geotag utah.gpx -geotime="2021:08:07 01:25:01+00:00" 694A0001.CR3 -o %d%f.xmp
-
-            exiftool_parameters = (
-                "-geotag",
-                os.path.join( program_options['gpx_file_folder'], "*.gpx" ),
-                "geotime",
-                curr_image_to_geotag['geotag_info']['timestamp'],
-                raw_file_absolute_path,
+                # Specify output to XMP. I'm not sure how it figured out it shoulduse XMP. Is -o automatically XMP?
+                #   No, exiftool extracts type of output by extension given to the OUTFILE parameter
+                "-o".encode(),
+                "%d%f.xmp".encode(),
             )
 
-            print( "exiftool parameters: " + json.dumps(exiftool_parameters, indent=4, sort_keys=True))
+            #print("Running EXIFTool XMP generation command")
+            execute_output = exiftool_handle.execute( *exiftool_parameters )
+            #print("Back from EXIFTool")
 
-            #exiftool_handle.execute_json( )
-
-            geotag_results = {
-                curr_image_to_geotag['year']: {
-                    curr_image_to_geotag['date']: {
-                        curr_image_to_geotag['filename']: curr_image_to_geotag['geotag_info']
-                    },
-                },
-            }
-
-            geotagged_images_queue.put( geotag_results )
+            #print( "Exiftool execute results:\n" + execute_output.decode() )
 
     print( "Child exiting cleanly")
 
@@ -664,60 +707,76 @@ def _main():
     program_options['exiftool_path'] = args.exiftool
     program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
     program_options['gpx_file_folder'] = args.gpx_file_folder
-    program_options['scratch_write_location'] = args.scratch_write_location
+    program_options['laptop_destination_folder'] = args.laptop_destination_folder
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
-    perf_timings = {
-        'total' : 0.0,
-        'entries': [],
-    }
+    perf_timer = performance_timer.PerformanceTimer()
 
     source_image_info = _enumerate_source_images(program_options)
-    _add_perf_timing(perf_timings, 'Enumerating source images', source_image_info['operation_time_seconds'])
+    perf_timer.add_perf_timing( 'Enumerating source images', source_image_info['operation_time_seconds'])
 
     manifest_info = _generate_source_manifest(source_image_info['source_dirs'])
-    _add_perf_timing(perf_timings, 'Creating source image manifest', manifest_info['operation_time_seconds'])
+    perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
     source_file_manifest = manifest_info['source_manifest']
 
     # Get timestamp for all image files
     timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
-    _add_perf_timing( perf_timings, 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
+    perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
+
+    # Enumerate files already in the destination directory
+    destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
+    perf_timer.add_perf_timing( "Listing existing files in destination folder",
+                                destination_files_results['operation_time_seconds'] )
+    existing_destination_files = destination_files_results['existing_files']
 
     # Determine unique filenames
-    print( "\nDetermining unique filenames in destination folder")
-    set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest )
-    _add_perf_timing( perf_timings, 'Generating unique destination filenames',
+    set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest,
+                                                                    existing_destination_files )
+    perf_timer.add_perf_timing( 'Generating unique destination filenames',
                       set_destination_filenames_results['operation_time_seconds'] )
     destination_file_manifests = set_destination_filenames_results['destination_file_manifests']
 
-    # Do file copies to *scratch write* location (read: laptop NVMe SSD)
-    print("\nFile copies from camera storage media to scratch write location starting")
-    copy_operation_results = _do_file_copies_to_scratch_write(program_options, source_file_manifest)
-    print("\tFile copies completed")
-    _add_perf_timing(perf_timings, 'Copying RAW files to scratch write location',
+    # Do file copies to laptop NVMe SSD
+    copy_operation_results = _do_file_copies_to_laptop(program_options, source_file_manifest)
+    perf_timer.add_perf_timing( 'Copying RAW files to laptop NVMe',
                      copy_operation_results['operation_time_seconds'])
-    scratch_write_tempdir = copy_operation_results['scratch_write_temp_directory']
 
-    # Do readback validation to make sure all writes to scratch area worked
-    print("\nReading files back from scratch write to verify contents still match original hash")
-    verify_operation_results = _do_readback_validation( source_file_manifest, scratch_write_tempdir )
+    # Do readback validation to make sure all writes to laptop worked
+    print("\nReading files back from laptop SSD to verify contents still match original hash")
+    verify_operation_results = _do_readback_validation( source_file_manifest, program_options )
     print( "\tDone")
-    _add_perf_timing(perf_timings, 'Validating all writes to fast scratch write storage are still byte-identical to source',
+    perf_timer.add_perf_timing( 'Validating all writes to laptop NVMe SSD are still byte-identical to source',
         verify_operation_results['operation_time_seconds'])
 
-    # Geotag images into XMP sidecar files
-    print("\nGeotagging RAW images using XMP sidecar files")
-    geotag_results = _geotag_images( destination_file_manifests, scratch_write_tempdir, program_options )
+    # Create XMP sidecar files
+    print("\nCreating XMP sidecar files for all RAW images")
+    xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
     print( "\tDone")
-    _add_perf_timing(perf_timings, 'Geotagging images', geotag_results['operation_time_seconds'])
+    perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
 
+    # Update XMP sidecar files with geotags
 
     # Pull geotags out of XMP and store in manifest
 
     # Write manifest files to each date dir in scratch
 
     # ZIP up the entire day in scratch storage (no compression!)
+    # zipfile_path = os.path.join( "e:\\", "test.zip" )
+    # print(f"\nCreating zip file {zipfile_path}")
+    # zip_file = zipfile.ZipFile( zipfile_path, mode='w' )
+    #
+    # for  curr_year in sorted(destination_file_manifests):
+    #     for  curr_date in sorted(destination_file_manifests[curr_year]):
+    #         curr_manifest = destination_file_manifests[curr_year][curr_date]
+    #         # print( f"Processing manifest for {curr_date_folder}" )
+    #         for curr_manifest_filename in sorted(curr_manifest):
+    #             curr_file_info = curr_manifest[curr_manifest_filename]
+    #             #print( json.dumps( curr_file_info, indent=4, sort_keys=True, default=str) )
+    #             file_to_add = os.path.join( scratch_write_tempdir.name, curr_year, curr_date, curr_manifest_filename )
+    #             zip_file.write( file_to_add )
+    #
+    # print(f"\tZip file {zipfile_path} created")
 
     # Take hashes of each ZIP file
 
@@ -731,8 +790,7 @@ def _main():
 
 
     # Final perf print
-    _display_perf_timings( perf_timings )
-
+    perf_timer.display_performance()
 
 if __name__ == "__main__":
     _main()
