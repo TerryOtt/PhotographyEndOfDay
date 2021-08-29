@@ -783,17 +783,89 @@ def _add_geotags_to_xmp( destination_file_manifests, program_options ):
                 #print( "\tFile info from manifest for this file: " + json.dumps(curr_image_data, indent=4, sort_keys=True, default=str) )
 
                 if 'geotag' in curr_image_data:
+                    geotag_data = curr_image_data['geotag']
+
+                    print( "Going to insert geotag data into EXIF data of XMP file: " + \
+                        json.dumps(geotag_data, sort_keys=True, indent=4, default=str) )
+
+                    latitude_string = str( abs(geotag_data['latitude_wgs84_degrees']) )
+
+                    # Spec for how GPS Coordinates should be formatted in EXIF portion of XMP:
+                    #   https://www.cipa.jp/std/documents/e/DC-X010-2017.pdf
+                    #
+                    # A.2.4.4 GPSCoodinate
+                    #
+                    # Value type of GPSCoodinate is a Text value in the form “DDD,MM,SSk” or “DDD,MM.mmk”, where:
+                    #
+                    # • DDD is a number of degrees
+                    # • MM is a number of minutes
+                    # • SS is a number of seconds
+                    # • mm is a fraction of minutes
+                    # • k is a single character N, S, E, or W indicating a direction (north, south, east, west)
+                    #
+                    # Leading zeros are not necessary for the for DDD, MM, and SS values. The DDD,MM.mmk form should be used
+                    # when any of the native Exif component rational values has a denominator other than 1. There can be any
+                    # number of fractional digits.
+
+                    latitude_degrees_string = str(abs(int(geotag_data['latitude_wgs84_degrees'])))
+                    latitude_fractional_degrees = abs(geotag_data['latitude_wgs84_degrees']) % 1
+                    latitude_fractional_minutes_string = f"{latitude_fractional_degrees * 60.0:.06f}"
+
+                    if geotag_data['latitude_wgs84_degrees'] >= 0:
+                        latitude_hemisphere = "N"
+                    else:
+                        latitude_hemisphere = "S"
+
+                    latitude_string = f"{latitude_degrees_string},{latitude_fractional_minutes_string}{latitude_hemisphere}"
+
+                    longitude_degrees_string = str(abs(int(geotag_data['longitude_wgs84_degrees'])))
+                    longitude_fractional_degrees = abs(geotag_data['longitude_wgs84_degrees']) % 1
+                    longitude_fractional_minutes_string = f"{longitude_fractional_degrees * 60.0:.06f}"
+
+                    if geotag_data['longitude_wgs84_degrees'] >= 0:
+                        longitude_hemisphere = "E"
+                    else:
+                        longitude_hemisphere = "W"
+
+                    longitude_string = f"{longitude_degrees_string},{longitude_fractional_minutes_string}{longitude_hemisphere}"
+
+                    string_replace_contents = \
+                        f"  <exif:GPSAltitude>{int(geotag_data['elevation_above_sea_level']['meters'] * 100)}/100</exif:GPSAltitude>\n" \
+                         "  <exif:GPSAltitudeRef>0</exif:GPSAltitudeRef>\n" \
+                        f"  <exif:GPSLatitude>{latitude_string}</exif:GPSLatitude>\n" \
+                        f"  <exif:GPSLongitude>{longitude_string}</exif:GPSLongitude>\n"
+
+                    # should_look_like = \
+                    #      "  <exif:GPSAltitude>128147/100</exif:GPSAltitude>\n" \
+                    #      "  <exif:GPSAltitudeRef>0</exif:GPSAltitudeRef>\n" \
+                    #      "  <exif:GPSLatitude>41,3.772866N</exif:GPSLatitude>\n" \
+                    #      "  <exif:GPSLongitude>112,14.433294W</exif:GPSLongitude>\n"
+
                     # Read in the XMP file
 
                     xmp_file_path = os.path.join( program_options['laptop_destination_folder'],
                                                   curr_image_data['destination_xmp_file'] )
 
-                    print( f"\tXMP file: {xmp_file_path}")
+                    #print( f"\tXMP file: {xmp_file_path}")
 
-                break
-            break
-        break
+                    with open( xmp_file_path, "r+") as xmp_handle:
+                        xmp_contents = xmp_handle.read()
 
+                        # Do replace
+                        xmp_contents_with_geotag = xmp_contents.replace(
+                            "  <exif:GPSAltitudeRef>0</exif:GPSAltitudeRef>\n",
+                            string_replace_contents )
+
+                        #print( f"XMP contents:\n{xmp_contents}")
+
+                        # Seek back to start of the file
+                        xmp_handle.seek(0)
+
+                        # Write our new contents
+                        xmp_handle.write( xmp_contents_with_geotag )
+
+                        # Truncate the file
+                        xmp_handle.truncate()
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -874,8 +946,8 @@ def _main():
     perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
 
     # Update XMP sidecar files with geotags
-    #add_geotags_to_xmp_results = _add_geotags_to_xmp( destination_file_manifests, program_options )
-    #perf_timer.add_perf_timing( 'Adding geotags to XMP files', add_geotags_to_xmp_results['operation_time_seconds'] )
+    add_geotags_to_xmp_results = _add_geotags_to_xmp( destination_file_manifests, program_options )
+    perf_timer.add_perf_timing( 'Adding geotags to XMP files', add_geotags_to_xmp_results['operation_time_seconds'] )
 
     # Pull geotags out of XMP and store in manifest
 
