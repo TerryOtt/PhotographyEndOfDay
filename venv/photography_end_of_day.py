@@ -785,8 +785,8 @@ def _add_geotags_to_xmp( destination_file_manifests, program_options ):
                 if 'geotag' in curr_image_data:
                     geotag_data = curr_image_data['geotag']
 
-                    print( "Going to insert geotag data into EXIF data of XMP file: " + \
-                        json.dumps(geotag_data, sort_keys=True, indent=4, default=str) )
+                    #print( "Going to insert geotag data into EXIF data of XMP file: " + \
+                    #    json.dumps(geotag_data, sort_keys=True, indent=4, default=str) )
 
                     latitude_string = str( abs(geotag_data['latitude_wgs84_degrees']) )
 
@@ -952,6 +952,15 @@ def _main():
     # Pull geotags out of XMP and store in manifest
 
     # Write manifest files to each date dir in scratch
+
+    # TODO:
+    #
+    #   - Change sourcedir to be sourcedir_full (e.g., 512GB CFexpress type B) and sourcedir_partial (256 SD cards)
+    #   - Add results of all partials into one hash. When done, compare to the full.
+    #   - Parallelize reading source imagery (reading two 256 GB partial SD cards and 512 GB CFexpress can fit in 40 gigabits with no contention)
+    #   - Add optional SD card destinations to arguments
+    #   - One thread per SD output
+    #       - Do all writes and then read back from external to make sure it worked
 
     # ZIP up the entire day in scratch storage (no compression!)
     # zipfile_path = os.path.join( "e:\\", "test.zip" )
