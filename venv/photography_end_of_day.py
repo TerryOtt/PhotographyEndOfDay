@@ -15,6 +15,8 @@ import glob
 import tempfile
 import zipfile
 import performance_timer
+import gpxpy
+import xml.etree.ElementTree
 
 
 def _parse_args():
@@ -311,6 +313,64 @@ def _exif_timestamp_worker( child_process_index, files_to_process_queue, process
     #print( f"Child {child_process_index} exiting cleanly")
 
 
+def _geocode_images( program_options, source_file_manifests ):
+    print( "\nGeocoding images" )
+
+    time_start = time.perf_counter()
+
+    print( "\tReading GPX files" )
+
+    gpx_file_wildcard = os.path.join( program_options['gpx_file_folder'], '*.gpx' )
+    gpx_files = glob.glob( gpx_file_wildcard )
+
+    gpx_file_data = []
+
+    for curr_gpx_file in gpx_files:
+        with open( curr_gpx_file, "r" ) as gpx_file_handle:
+            gpx_data = gpxpy.parse( gpx_file_handle )
+            gpx_file_data.append( gpx_data )
+
+    #print("\tGPX file parsing complete")
+
+    feet_in_one_meter = 3.28084
+
+    print("\tGeotagging all images")
+    for curr_file_name in source_file_manifests:
+        #print( f"\t\tTrying to geocode {curr_file_name}")
+        #print( "image data:\n" + json.dumps(source_file_manifests[curr_file_name], indent=4, sort_keys=True, default=str))
+
+        curr_file_data = source_file_manifests[curr_file_name]
+        curr_timestamp = curr_file_data['timestamp']
+        for curr_gpx_data in gpx_file_data:
+            computed_location = curr_gpx_data.get_location_at( curr_timestamp )
+            if computed_location:
+                location_info = {
+                    'latitude_wgs84_degrees': computed_location[0].latitude,
+                    'longitude_wgs84_degrees'             : computed_location[0].longitude,
+                    'elevation_above_sea_level'     : {
+                        'meters'    : computed_location[0].elevation,
+                        'feet'      : computed_location[0].elevation * feet_in_one_meter,
+                    },
+                }
+
+                curr_file_data['geotag'] = location_info
+            else:
+                #print( "\tlocation not found")
+                pass
+
+        if 'geotag' not in curr_file_data:
+            print( f"\tINFO: no location was found in GPX files for {curr_file_name}" )
+
+    time_end = time.perf_counter()
+    operation_time_seconds = time_end - time_start
+
+    #print("\tAll images geocoded" )
+
+    return {
+        'operation_time_seconds': operation_time_seconds,
+    }
+
+
 def _get_existing_files_in_destination( source_file_manifest, program_options ):
 
     time_start = time.perf_counter()
@@ -335,28 +395,30 @@ def _get_existing_files_in_destination( source_file_manifest, program_options ):
 
         date_string = f"{curr_year:04d}-{curr_month:02d}-{curr_day:02d}"
 
+        #print( f"File: {curr_source_file_manifest_file}, date: \"{date_string}\"")
 
         if year_str not in existing_files:
             existing_files[year_str] = {}
 
-            if date_string not in existing_files[year_str]:
-                existing_files[year_str][date_string] = {}
+        if date_string not in existing_files[year_str]:
+            existing_files[year_str][date_string] = {}
+            #print( f"\tCreated existing files entry for \"{year_str}\{date_string}\"" )
 
-                #print( f"Folder to search: {folder_to_search}")
-                folder_to_search = os.path.join(program_options['laptop_destination_folder'],
-                                                year_str,
-                                                date_string)
+            #print( f"Folder to search: {folder_to_search}")
+            folder_to_search = os.path.join(program_options['laptop_destination_folder'],
+                                            year_str,
+                                            date_string)
 
-                if os.path.exists( folder_to_search ) and os.path.isdir( folder_to_search):
+            if os.path.exists( folder_to_search ) and os.path.isdir( folder_to_search):
 
-                    matching_files = glob.glob( os.path.join( folder_to_search, f"*.{program_options['file_extension']}"))
+                matching_files = glob.glob( os.path.join( folder_to_search, f"*.{program_options['file_extension']}"))
 
-                    total_existing_file_count += len( matching_files )
+                total_existing_file_count += len( matching_files )
 
-                    for curr_match in matching_files:
-                        existing_files[year_str][date_string][curr_match] = None
+                for curr_match in matching_files:
+                    existing_files[year_str][date_string][curr_match] = None
 
-                    print( f"\tAdded {len(matching_files)} .{program_options['file_extension']} files from {folder_to_search}")
+                print( f"\tAdded {len(matching_files)} .{program_options['file_extension']} files from {folder_to_search}")
 
     time_end = time.perf_counter()
     operation_time_seconds = time_end - time_start
@@ -381,16 +443,32 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
             f"{file_data['timestamp'].year:4d}-{file_data['timestamp'].month:02d}-{file_data['timestamp'].day:02d}",
     }
 
+    #print( f"\tTrying to find unique destination filename for {date_components['year']}\{date_components['date_iso8601']}\{source_file}")
+
     if date_components['year'] not in destination_file_manifests:
         destination_file_manifests[ date_components['year']] = {}
 
     if date_components['date_iso8601'] not in destination_file_manifests[ date_components['year'] ]:
         destination_file_manifests[ date_components['year'] ][ date_components['date_iso8601']] = {}
+        #print( f"\t\tCreated destination file manifest entry for \"{date_components['year']}\{date_components['date_iso8601']}\"")
 
     file_data['destination_subfolder'] = os.path.join( date_components['year'], date_components['date_iso8601'] )
 
     manifest_for_this_file = destination_file_manifests[ date_components['year'] ][ date_components['date_iso8601']]
-    existing_destination_files_in_dir = existing_destination_files[ date_components['year'] ][ date_components['date_iso8601']]
+    if date_components['year'] in existing_destination_files and    \
+            date_components['date_iso8601'] in existing_destination_files[date_components['year']]:
+        existing_destination_files_in_dir = existing_destination_files[ date_components['year'] ][ date_components['date_iso8601']]
+    else:
+        print( "\tFound a file with a date not included in the existing destination files dictionary: " 
+               f"\"{date_components['year']}\{date_components['date_iso8601']}\"" )
+
+        print( "\tListing all entries in the existing destination files dictionary:")
+        for curr_year in sorted(existing_destination_files):
+            for curr_date in sorted(existing_destination_files[curr_year]):
+                print( f"\t\tFound year/date combo {curr_year}\{curr_date}" )
+
+        print("\tDone")
+
 
     # Find first filename that doesn't exist in the given destination manifest
     basename = os.path.basename( source_file )
@@ -415,6 +493,12 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
     file_data[ 'unique_destination_file_path' ] = os.path.join( date_components['year'],
                                                                 date_components['date_iso8601'],
                                                                 test_filename )
+
+    # Record the XMP filename for this destination file
+    (filename_no_extension, filename_extension) = os.path.splitext( test_filename )
+    file_data[ 'destination_xmp_file' ] = os.path.join( date_components['year'],
+                                                       date_components['date_iso8601'],
+                                                       f"{filename_no_extension}.xmp" )
 
     # Update destination manifest
     manifest_for_this_file[ test_filename ] = file_data
@@ -615,10 +699,6 @@ def _create_xmp_files( destination_file_manifests, program_options ):
         "operation_time_seconds"    : operation_time_seconds,
     }
 
-    # TODO: farm this work out to a child process
-
-    process_handles = []
-
 
 def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_done_writing, program_options ):
 
@@ -687,8 +767,42 @@ def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_
 
             #print( "Exiftool execute results:\n" + execute_output.decode() )
 
-    print( "Child exiting cleanly")
+    #print( "Child exiting cleanly")
 
+
+def _add_geotags_to_xmp( destination_file_manifests, program_options ):
+    print( "\nAdding geotags to XMP files")
+
+    start_time = time.perf_counter()
+
+    for curr_year in sorted(destination_file_manifests):
+        for curr_date in sorted(destination_file_manifests[curr_year]):
+            for curr_file in sorted(destination_file_manifests[curr_year][curr_date]):
+                curr_image_data = destination_file_manifests[curr_year][curr_date][curr_file]
+                #print( f"\tAdding geotag for {curr_file}" )
+                #print( "\tFile info from manifest for this file: " + json.dumps(curr_image_data, indent=4, sort_keys=True, default=str) )
+
+                if 'geotag' in curr_image_data:
+                    # Read in the XMP file
+
+                    xmp_file_path = os.path.join( program_options['laptop_destination_folder'],
+                                                  curr_image_data['destination_xmp_file'] )
+
+                    print( f"\tXMP file: {xmp_file_path}")
+
+                break
+            break
+        break
+
+
+    end_time = time.perf_counter()
+    operation_time_seconds = end_time - start_time
+
+    print ("\tDone")
+
+    return {
+        "operation_time_seconds"    : operation_time_seconds,
+    }
 
 
 def _main():
@@ -724,6 +838,10 @@ def _main():
     timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
     perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
 
+    # Geocode all images now that we know their timestamps
+    geocode_images_results = _geocode_images( program_options, source_file_manifest )
+    perf_timer.add_perf_timing( 'Geocoding images', geocode_images_results['operation_time_seconds'])
+
     # Enumerate files already in the destination directory
     destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
     perf_timer.add_perf_timing( "Listing existing files in destination folder",
@@ -756,6 +874,8 @@ def _main():
     perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
 
     # Update XMP sidecar files with geotags
+    #add_geotags_to_xmp_results = _add_geotags_to_xmp( destination_file_manifests, program_options )
+    #perf_timer.add_perf_timing( 'Adding geotags to XMP files', add_geotags_to_xmp_results['operation_time_seconds'] )
 
     # Pull geotags out of XMP and store in manifest
 
