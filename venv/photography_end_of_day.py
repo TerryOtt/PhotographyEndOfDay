@@ -24,7 +24,14 @@ def _parse_args():
     arg_parser.add_argument("--debug", help="Lower logging level from INFO to DEBUG", action="store_true" )
     arg_parser.add_argument("--logfile", help="Path to file where the app log will be created",
                             default="photo_end_of_day.log" )
-    arg_parser.add_argument( "--sourcedir", help="Path to a source directory", required=True, action="append" )
+    arg_parser.add_argument( "--sourcedir_full",
+                             help="Path to a source directory with the *full* set of contents",
+                             required=True )
+
+    # The "Action append" lets the parameter be specified multiple times, but it's still optional so may exist no times
+    arg_parser.add_argument( "--sourcedir_partial",
+                             help="Path to a source directory with a *partial* set of the contents",
+                             action="append")
     arg_parser.add_argument( "fileext", help="File extension, e.g. \"NEF\", \"CR3\""  )
     arg_parser.add_argument( "exiftool", help="Path to the exiftool utility" )
     arg_parser.add_argument("file_timestamp_utc_offset_hours",
@@ -36,49 +43,150 @@ def _parse_args():
     return arg_parser.parse_args()
 
 
+def _scan_source_dir_for_images( curr_source_dir, program_options, source_list_type, directory_scan_results_queue ):
+    image_files = []
+    cumulative_bytes = 0
+    for subdir, dirs, files in os.walk(curr_source_dir):
+        # logging.debug(f"Found subdir {subdir}")
+        for filename in files:
+            if filename.lower().endswith(program_options['file_extension']):
+                file_absolute_path = os.path.join(curr_source_dir, subdir, filename)
+                # logging.debug( "Found image with full path: \"{0}\"".format(file_absolute_path))
+                file_size_bytes = os.path.getsize(file_absolute_path)
+                # logging.debug(f"File size of {file_absolute_path}: {file_size_bytes}")
+                cumulative_bytes += file_size_bytes
+                image_files.append(
+                    {
+                        'file_path': {
+                            'absolute': file_absolute_path,
+                            'relative': os.path.relpath(file_absolute_path, curr_source_dir)
+                        },
+                        'filesize_bytes': file_size_bytes,
+                    }
+                )
+                # break
+            else:
+                # logging.debug( "Skipping non-image file {0}".format(filename))
+                pass
+
+    # Walk complete, send results to parent
+    results_of_walk = {
+        'source_dir'        : curr_source_dir,
+        'source_list_type'  : source_list_type,
+        'image_files_found' : image_files,
+    }
+
+    directory_scan_results_queue.put( results_of_walk )
+
+    # Now can terminate child worker process cleanly, ready to rejoin with parent
+
+
 def _enumerate_source_images(program_options):
     start_time = time.perf_counter()
 
-    files_by_source_dir = {}
-
     print( "\nEnumerating source images")
 
-    total_file_count = 0
+    source_file_lists = {
+        'full': {},
+        'partial': None,
+    }
 
-    for curr_source_dir in program_options['source_dirs']:
-        print( f"\tScanning \"{curr_source_dir}\" for RAW image files with extension " +
-            f".\"{program_options['file_extension']}\"")
+    process_handles = []
 
-        image_files = []
-        cumulative_bytes = 0
-        for subdir, dirs, files in os.walk(curr_source_dir):
-            #logging.debug(f"Found subdir {subdir}")
-            for filename in files:
-                if filename.lower().endswith( program_options['file_extension'] ):
-                    file_absolute_path = os.path.join( curr_source_dir, subdir, filename)
-                    #logging.debug( "Found image with full path: \"{0}\"".format(file_absolute_path))
-                    file_size_bytes = os.path.getsize(file_absolute_path)
-                    #logging.debug(f"File size of {file_absolute_path}: {file_size_bytes}")
-                    cumulative_bytes += file_size_bytes
-                    image_files.append(
-                        {
-                            'file_path'         : {
-                                'absolute'          : file_absolute_path,
-                                'relative'          : os.path.relpath( file_absolute_path, curr_source_dir )
-                            },
-                            'filesize_bytes'    : file_size_bytes,
-                        }
-                    )
-                    #break
-                else:
-                    #logging.debug( "Skipping non-image file {0}".format(filename))
-                    pass
-        files_by_source_dir[ curr_source_dir ] = {
-            'files'             : image_files,
-            'cumulative_size'   : cumulative_bytes,
-        }
+    # Queue that children use to write results of directory scan back to parent
+    directory_scan_results_queue = multiprocessing.Queue()
 
-        total_file_count += len( image_files )
+    # Fire off scanner for the directory with ALL the shots (e.g., 512 GB CFexpress Type B card with *all* the shots for the day)
+    which_source_list = 'full'
+    process_handle = multiprocessing.Process(target=_scan_source_dir_for_images,
+                                             args=(program_options['sourcedirs']['full'],
+                                                   program_options,
+                                                   which_source_list,
+                                                   directory_scan_results_queue))
+
+    process_handle.start()
+    print(f"\tScanning \"{program_options['sourcedirs']['full']}\" for RAW image files with extension " +
+          f".\"{program_options['file_extension']}\" (full contents)")
+
+    process_handles.append(process_handle)
+
+    directories_scanned = 1
+
+    # Now fire off scanners for directories with partial contents (e.g., 256 GB SD card with half the day's shots) -- if any
+    if program_options['sourcedirs']['partial']:
+        which_source_list = 'partial'
+        for curr_partial_dir in sorted(program_options['sourcedirs']['partial']):
+            process_handle = multiprocessing.Process(target=_scan_source_dir_for_images,
+                                                     args=(curr_partial_dir,
+                                                           program_options,
+                                                           which_source_list,
+                                                           directory_scan_results_queue))
+            process_handle.start()
+            print(f"\tScanning \"{curr_partial_dir}\" for RAW image files with extension " +
+                  f".\"{program_options['file_extension']}\" (partial contents)")
+
+            process_handles.append(process_handle)
+            directories_scanned += 1
+
+    # Wait for all the children to rejoin cleanly
+    print( "\tParent waiting for workers who are scanning" )
+    while process_handles:
+        curr_handle = process_handles.pop()
+        curr_handle.join()
+
+    print( "\tAll workers have rejoined cleanly" )
+
+    for curr_index in range( directories_scanned ):
+        scan_results = directory_scan_results_queue.get()
+        print( f"\tGot scan results for \"{scan_results['source_dir']}\" back")
+
+        if scan_results['source_list_type'] == 'full':
+            source_file_list_to_populate = source_file_lists['full']
+        elif scan_results['source_list_type'] == 'partial':
+            if source_file_lists['partial'] is None:
+                source_file_lists['partial'] = {}
+            source_file_list_to_populate = source_file_lists['partial']
+
+        for curr_dir_scan_result in scan_results['image_files_found']:
+            curr_relative_path_file_name = curr_dir_scan_result['file_path']['relative']
+
+            if curr_relative_path_file_name in source_file_list_to_populate:
+                raise ValueError(f"Found duplicate entry {curr_relative_path_file_name} in a file listing -- WTF!?!?!")
+
+            # Put the confirmed-unique entry into the file list
+            source_file_list_to_populate[curr_relative_path_file_name] = curr_dir_scan_result
+
+    # We've populated the full list, and the partial list (if we got partial dirs). Need to make sure
+    #   the partial list matches the full list (only worry about relative filenames -- we'll check contents later when we're
+    #   doing the manifests and are hashing the shit out of everything
+    if source_file_lists['partial'] is not None:
+        if sorted(source_file_lists['full'].keys()) != sorted( source_file_lists['partial'].keys() ):
+            raise ValueError("List of relative files in full and partial lists did not match")
+        print( "\tCool, the full file list and the combined results of all the partials give us same file list!")
+
+    total_file_count = len( source_file_lists['full'].keys() )
+
+    # Create a directory that maps relative file name to array of all the absolute file paths we are going to need to
+    #       check it against
+    final_file_list = {}
+    for curr_relative_path in sorted( source_file_lists['full'] ):
+        final_file_list[ curr_relative_path ] = [ source_file_lists[ 'full' ][ curr_relative_path ][ 'file_path'][ 'absolute' ] ]
+
+    if source_file_lists['partial'] is not None:
+        for curr_relative_path in sorted( source_file_lists['partial'] ):
+            final_file_list[curr_relative_path].append( source_file_lists['partial'][ curr_relative_path ]['file_path']['absolute'] )
+
+    #
+    #
+    #
+    # for curr_source_dir in program_options['source_dirs']:
+    #     files_by_source_dir[ curr_source_dir ] = {
+    #         'files'             : image_files,
+    #         'cumulative_size'   : cumulative_bytes,
+    #     }
+    #
+    #     total_file_count += len( image_files )
+    #
 
     end_time = time.perf_counter()
 
@@ -88,7 +196,7 @@ def _enumerate_source_images(program_options):
     print ( f"\tFound {total_file_count} .{program_options['file_extension']} files")
 
     return {
-        'source_dirs'               : files_by_source_dir,
+        'file_list'                 : final_file_list,
         'operation_time_seconds'    : operation_time_seconds,
     }
 
@@ -888,7 +996,11 @@ def _main():
     logging.basicConfig( filename=args.logfile, level=log_level )
     #logging.basicConfig(level=log_level)
 
-    program_options['source_dirs'] = args.sourcedir
+    program_options['sourcedirs'] = {
+        'full'      : args.sourcedir_full,
+        'partial'   : args.sourcedir_partial,
+    }
+
     program_options['file_extension'] = args.fileext.lower()
     program_options['exiftool_path'] = args.exiftool
     program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
@@ -902,52 +1014,54 @@ def _main():
     source_image_info = _enumerate_source_images(program_options)
     perf_timer.add_perf_timing( 'Enumerating source images', source_image_info['operation_time_seconds'])
 
-    manifest_info = _generate_source_manifest(source_image_info['source_dirs'])
-    perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
-    source_file_manifest = manifest_info['source_manifest']
+    print( "File list to create source manifest:\n" + json.dumps(source_image_info['file_list'], indent=4, sort_keys=True) )
 
-    # Get timestamp for all image files
-    timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
-    perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
-
-    # Geocode all images now that we know their timestamps
-    geocode_images_results = _geocode_images( program_options, source_file_manifest )
-    perf_timer.add_perf_timing( 'Geocoding images', geocode_images_results['operation_time_seconds'])
-
-    # Enumerate files already in the destination directory
-    destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
-    perf_timer.add_perf_timing( "Listing existing files in destination folder",
-                                destination_files_results['operation_time_seconds'] )
-    existing_destination_files = destination_files_results['existing_files']
-
-    # Determine unique filenames
-    set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest,
-                                                                    existing_destination_files )
-    perf_timer.add_perf_timing( 'Generating unique destination filenames',
-                      set_destination_filenames_results['operation_time_seconds'] )
-    destination_file_manifests = set_destination_filenames_results['destination_file_manifests']
-
-    # Do file copies to laptop NVMe SSD
-    copy_operation_results = _do_file_copies_to_laptop(program_options, source_file_manifest)
-    perf_timer.add_perf_timing( 'Copying RAW files to laptop NVMe',
-                     copy_operation_results['operation_time_seconds'])
-
-    # Do readback validation to make sure all writes to laptop worked
-    print("\nReading files back from laptop SSD to verify contents still match original hash")
-    verify_operation_results = _do_readback_validation( source_file_manifest, program_options )
-    print( "\tDone")
-    perf_timer.add_perf_timing( 'Validating all writes to laptop NVMe SSD are still byte-identical to source',
-        verify_operation_results['operation_time_seconds'])
-
-    # Create XMP sidecar files
-    print("\nCreating XMP sidecar files for all RAW images")
-    xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
-    print( "\tDone")
-    perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
-
-    # Update XMP sidecar files with geotags
-    add_geotags_to_xmp_results = _add_geotags_to_xmp( destination_file_manifests, program_options )
-    perf_timer.add_perf_timing( 'Adding geotags to XMP files', add_geotags_to_xmp_results['operation_time_seconds'] )
+    # manifest_info = _generate_source_manifest(source_image_info['source_dirs'])
+    # perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
+    # source_file_manifest = manifest_info['source_manifest']
+    #
+    # # Get timestamp for all image files
+    # timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
+    # perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
+    #
+    # # Geocode all images now that we know their timestamps
+    # geocode_images_results = _geocode_images( program_options, source_file_manifest )
+    # perf_timer.add_perf_timing( 'Geocoding images', geocode_images_results['operation_time_seconds'])
+    #
+    # # Enumerate files already in the destination directory
+    # destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
+    # perf_timer.add_perf_timing( "Listing existing files in destination folder",
+    #                             destination_files_results['operation_time_seconds'] )
+    # existing_destination_files = destination_files_results['existing_files']
+    #
+    # # Determine unique filenames
+    # set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest,
+    #                                                                 existing_destination_files )
+    # perf_timer.add_perf_timing( 'Generating unique destination filenames',
+    #                   set_destination_filenames_results['operation_time_seconds'] )
+    # destination_file_manifests = set_destination_filenames_results['destination_file_manifests']
+    #
+    # # Do file copies to laptop NVMe SSD
+    # copy_operation_results = _do_file_copies_to_laptop(program_options, source_file_manifest)
+    # perf_timer.add_perf_timing( 'Copying RAW files to laptop NVMe',
+    #                  copy_operation_results['operation_time_seconds'])
+    #
+    # # Do readback validation to make sure all writes to laptop worked
+    # print("\nReading files back from laptop SSD to verify contents still match original hash")
+    # verify_operation_results = _do_readback_validation( source_file_manifest, program_options )
+    # print( "\tDone")
+    # perf_timer.add_perf_timing( 'Validating all writes to laptop NVMe SSD are still byte-identical to source',
+    #     verify_operation_results['operation_time_seconds'])
+    #
+    # # Create XMP sidecar files
+    # print("\nCreating XMP sidecar files for all RAW images")
+    # xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
+    # print( "\tDone")
+    # perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
+    #
+    # # Update XMP sidecar files with geotags
+    # add_geotags_to_xmp_results = _add_geotags_to_xmp( destination_file_manifests, program_options )
+    # perf_timer.add_perf_timing( 'Adding geotags to XMP files', add_geotags_to_xmp_results['operation_time_seconds'] )
 
     # Pull geotags out of XMP and store in manifest
 
