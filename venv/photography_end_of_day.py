@@ -46,12 +46,13 @@ def _parse_args():
 def _scan_source_dir_for_images( curr_source_dir, program_options, source_list_type, directory_scan_results_queue ):
     image_files = []
     cumulative_bytes = 0
+    #print(f"\tChild process starting walk of {curr_source_dir}")
+
     for subdir, dirs, files in os.walk(curr_source_dir):
-        # logging.debug(f"Found subdir {subdir}")
         for filename in files:
             if filename.lower().endswith(program_options['file_extension']):
                 file_absolute_path = os.path.join(curr_source_dir, subdir, filename)
-                # logging.debug( "Found image with full path: \"{0}\"".format(file_absolute_path))
+                #print( "\tFound image with full path: \"{0}\"".format(file_absolute_path))
                 file_size_bytes = os.path.getsize(file_absolute_path)
                 # logging.debug(f"File size of {file_absolute_path}: {file_size_bytes}")
                 cumulative_bytes += file_size_bytes
@@ -79,6 +80,7 @@ def _scan_source_dir_for_images( curr_source_dir, program_options, source_list_t
     directory_scan_results_queue.put( results_of_walk )
 
     # Now can terminate child worker process cleanly, ready to rejoin with parent
+    #print( f"\tChild process walking {curr_source_dir} terminated cleanly")
 
 
 def _enumerate_source_images(program_options):
@@ -98,44 +100,37 @@ def _enumerate_source_images(program_options):
 
     # Fire off scanner for the directory with ALL the shots (e.g., 512 GB CFexpress Type B card with *all* the shots for the day)
     which_source_list = 'full'
-    process_handle = multiprocessing.Process(target=_scan_source_dir_for_images,
+    curr_handle = multiprocessing.Process(target=_scan_source_dir_for_images,
                                              args=(program_options['sourcedirs']['full'],
                                                    program_options,
                                                    which_source_list,
                                                    directory_scan_results_queue))
 
-    process_handle.start()
+    curr_handle.start()
     print(f"\tScanning \"{program_options['sourcedirs']['full']}\" for RAW image files with extension " +
           f".\"{program_options['file_extension']}\" (full contents)")
 
-    process_handles.append(process_handle)
+    process_handles.append(curr_handle)
 
     directories_scanned = 1
 
-    # Now fire off scanners for directories with partial contents (e.g., 256 GB SD card with half the day's shots) -- if any
+    #Now fire off scanners for directories with partial contents (e.g., 256 GB SD card with half the day's shots) -- if any
     if program_options['sourcedirs']['partial']:
         which_source_list = 'partial'
         for curr_partial_dir in sorted(program_options['sourcedirs']['partial']):
-            process_handle = multiprocessing.Process(target=_scan_source_dir_for_images,
+            curr_handle = multiprocessing.Process(target=_scan_source_dir_for_images,
                                                      args=(curr_partial_dir,
                                                            program_options,
                                                            which_source_list,
                                                            directory_scan_results_queue))
-            process_handle.start()
+            curr_handle.start()
             print(f"\tScanning \"{curr_partial_dir}\" for RAW image files with extension " +
                   f".\"{program_options['file_extension']}\" (partial contents)")
 
-            process_handles.append(process_handle)
+            process_handles.append(curr_handle)
             directories_scanned += 1
 
-    # Wait for all the children to rejoin cleanly
-    #print( "\tParent waiting for workers who are scanning" )
-    while process_handles:
-        curr_handle = process_handles.pop()
-        curr_handle.join()
-
-    #print( "\tAll workers have rejoined cleanly" )
-
+    # Children cannot terminate with a queue that's full, so drain the results queue
     for curr_index in range( directories_scanned ):
         scan_results = directory_scan_results_queue.get()
         #print( f"\tGot scan results for \"{scan_results['source_dir']}\" back")
@@ -155,6 +150,16 @@ def _enumerate_source_images(program_options):
 
             # Put the confirmed-unique entry into the file list
             source_file_list_to_populate[curr_relative_path_file_name] = curr_dir_scan_result
+
+    # Wait for all the children to rejoin cleanly
+    while process_handles:
+        rejoin_handle = process_handles.pop()
+        #print( f"Waiting for {pprint.pformat(rejoin_handle)} to rejoin")
+        rejoin_handle.join()
+        #print( "Child process rejoined" )
+
+    #print( "\tAll workers have rejoined cleanly" )
+
 
     # We've populated the full list, and the partial list (if we got partial dirs). Need to make sure
     #   the partial list matches the full list (only worry about relative filenames -- we'll check contents later when we're
@@ -194,7 +199,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
 
     print( "\nGenerating source manifest")
 
-    # Create dictionary with list of absolute paths per drive.  We are going to have N workers per drive
+    # Create dictionary with list of absolute paths per drive.  We are going to have one file reader per drive
     entries_by_drive = {}
 
     for curr_absolute_path in reverse_file_map:
@@ -247,7 +252,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     # Let the children know to not wait if queue is empty
     parent_done_writing.set()
 
-    #print( f"Parent done writing {file_count} entries to process queue")
+    print( f"Parent done writing {file_count} entries to process queue")
 
     source_manifest = {}
 
@@ -255,7 +260,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     #   same number of entries out of the processed data queue
     for i in range( file_count ):
         file_hash_data = file_hashes_queue.get()
-        #print(f"Parent got hash {i+1}")
+        print(f"Parent got hash {i+1}")
 
         # If the relative path exists in the source manifest, make sure the hashes line up!
         relative_path = file_hash_data['paths']['relative']
@@ -267,6 +272,13 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
                 'hashes': file_hash_data['hashes'],
                 'filesize_bytes'    : source_file_list[ relative_path ]['filesize_bytes']
             }
+
+    # Rejoin the children
+    print( "Waiting for children to rejoin")
+    while process_handles:
+        curr_handle = process_handles.pop()
+        curr_handle.join()
+    print("All children rejoined")
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -302,11 +314,11 @@ def _source_file_hash_worker( worker_index, source_file_queue, hash_queue, paren
 
         hash_queue.put(
             {
+                "type": "file_hash",
                 "paths": {
                     "absolute": curr_file_entry['absolute_path'],
                     "relative": curr_file_entry['relative_path'],
                 },
-
                 "hashes": computed_hashes,
             }
         )
@@ -633,7 +645,7 @@ def _set_destination_filenames( program_options, source_file_manifest, existing_
 
     print( "\nDetermining unique filenames in destination folder")
 
-    raise ValueError("Not actually detecting duplicates in destination directory anymore, what's up?")
+    #raise ValueError("Not actually detecting duplicates in destination directory anymore, what's up?")
 
     start_time = time.perf_counter()
 
