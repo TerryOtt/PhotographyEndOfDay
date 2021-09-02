@@ -129,16 +129,16 @@ def _enumerate_source_images(program_options):
             directories_scanned += 1
 
     # Wait for all the children to rejoin cleanly
-    print( "\tParent waiting for workers who are scanning" )
+    #print( "\tParent waiting for workers who are scanning" )
     while process_handles:
         curr_handle = process_handles.pop()
         curr_handle.join()
 
-    print( "\tAll workers have rejoined cleanly" )
+    #print( "\tAll workers have rejoined cleanly" )
 
     for curr_index in range( directories_scanned ):
         scan_results = directory_scan_results_queue.get()
-        print( f"\tGot scan results for \"{scan_results['source_dir']}\" back")
+        #print( f"\tGot scan results for \"{scan_results['source_dir']}\" back")
 
         if scan_results['source_list_type'] == 'full':
             source_file_list_to_populate = source_file_lists['full']
@@ -166,27 +166,14 @@ def _enumerate_source_images(program_options):
 
     total_file_count = len( source_file_lists['full'].keys() )
 
-    # Create a directory that maps relative file name to array of all the absolute file paths we are going to need to
-    #       check it against
-    final_file_list = {}
+    # Create a directory that maps all absolute file paths to the relative one they have in common
+    reverse_file_list = {}
     for curr_relative_path in sorted( source_file_lists['full'] ):
-        final_file_list[ curr_relative_path ] = [ source_file_lists[ 'full' ][ curr_relative_path ][ 'file_path'][ 'absolute' ] ]
+        reverse_file_list[ source_file_lists['full'][curr_relative_path][ 'file_path'][ 'absolute' ] ] = curr_relative_path
 
     if source_file_lists['partial'] is not None:
         for curr_relative_path in sorted( source_file_lists['partial'] ):
-            final_file_list[curr_relative_path].append( source_file_lists['partial'][ curr_relative_path ]['file_path']['absolute'] )
-
-    #
-    #
-    #
-    # for curr_source_dir in program_options['source_dirs']:
-    #     files_by_source_dir[ curr_source_dir ] = {
-    #         'files'             : image_files,
-    #         'cumulative_size'   : cumulative_bytes,
-    #     }
-    #
-    #     total_file_count += len( image_files )
-    #
+            reverse_file_list[ source_file_lists['partial'][curr_relative_path]['file_path']['absolute'] ] = curr_relative_path
 
     end_time = time.perf_counter()
 
@@ -196,16 +183,33 @@ def _enumerate_source_images(program_options):
     print ( f"\tFound {total_file_count} .{program_options['file_extension']} files")
 
     return {
-        'file_list'                 : final_file_list,
+        'source_file_list'          : source_file_lists['full'],
+        'reverse_map'               : reverse_file_list,
         'operation_time_seconds'    : operation_time_seconds,
     }
 
 
-def _generate_source_manifest( source_dirs_info ):
+def _generate_source_manifest( reverse_file_map, source_file_list ):
     start_time = time.perf_counter()
 
-    source_manifests = {}
     print( "\nGenerating source manifest")
+
+    # Create dictionary with list of absolute paths per drive.  We are going to have N workers per drive
+    entries_by_drive = {}
+
+    for curr_absolute_path in reverse_file_map:
+        file_drive = curr_absolute_path[:3]
+        if file_drive not in entries_by_drive:
+            entries_by_drive[ file_drive ] = []
+
+        entries_by_drive[ file_drive ].append(
+            {
+                "absolute_path": curr_absolute_path,
+                "relative_path": reverse_file_map[curr_absolute_path],
+            }
+        )
+
+    #print( "\tEntries by drive:\n" + json.dumps( entries_by_drive, indent=4, sort_keys=True) )
 
     process_handles = []
 
@@ -218,63 +222,60 @@ def _generate_source_manifest( source_dirs_info ):
     # Event object that parent uses so children know when to exit
     parent_done_writing = multiprocessing.Event()
 
-    for i in range(multiprocessing.cpu_count()):
+    for i in range( len(entries_by_drive.keys()) ):
         process_handle = multiprocessing.Process( target=_source_file_hash_worker,
                                                   args=(i+1, files_to_process_queue,
                                                         file_hashes_queue,
                                                         parent_done_writing) )
 
         process_handle.start()
-        #logging.debug(f"Parent back from start on child process {i+1}")
+        logging.debug(f"Parent back from start on child process {i+1}")
         process_handles.append( process_handle )
 
     # Load up the queue with all the files we want hashes of
     file_count = 0
-    for curr_source_dir in source_dirs_info:
-        print( f"\tSource directory: {curr_source_dir}")
-        source_manifests[ curr_source_dir ] = {}
+    for curr_source_drive in sorted(entries_by_drive):
+        #print( f"\tSource drive: {curr_source_drive}")
 
-        for curr_file in source_dirs_info[curr_source_dir]['files']:
+        for curr_file in entries_by_drive[curr_source_drive]:
             #print( f"\t\tFile: {curr_file}")
 
-            files_to_process_queue.put(
-                {
-                    'source_dir'    : curr_source_dir,
-                    'file_to_hash'  : curr_file,
-                }
-            )
-            file_count += 1
+            files_to_process_queue.put( curr_file )
+
+        file_count += len( entries_by_drive[curr_source_drive] )
 
     # Let the children know to not wait if queue is empty
     parent_done_writing.set()
+
+    #print( f"Parent done writing {file_count} entries to process queue")
+
+    source_manifest = {}
 
     # We know how many files we wrote into the queue that children read out of. Now read
     #   same number of entries out of the processed data queue
     for i in range( file_count ):
         file_hash_data = file_hashes_queue.get()
-        source_manifests[ file_hash_data['source_dir']][ file_hash_data['file_info']['file_path'] ['relative'] ] = {
-            'filesize_bytes'    : file_hash_data['file_info']['filesize_bytes'],
-            'hashes'          : file_hash_data['file_info']['hashes'],
-        }
+        #print(f"Parent got hash {i+1}")
 
-    # If there are two source directories provided, their two manifests best be identical
-    if len( source_manifests.keys() ) == 2:
-        source_dirs = sorted( source_manifests.keys() )
-        if source_manifests[ source_dirs[0] ] != source_manifests[ source_dirs[1] ]:
-            print( f"\tFATAL: manifests for the two source dirs {source_dirs} did not come out identical, issues")
+        # If the relative path exists in the source manifest, make sure the hashes line up!
+        relative_path = file_hash_data['paths']['relative']
+        if relative_path in source_manifest:
+            if file_hash_data['hashes'] != file_hash_data['hashes']:
+                raise ValueError( f"Got hash file mismatch on {relative_path}")
         else:
-            print( "\tThe two source directories have byte-identical contents -- as expected!")
-
-    #print( json.dumps(source_manifests, indent=4, sort_keys=True))
+            source_manifest[ relative_path ] = {
+                'hashes': file_hash_data['hashes'],
+                'filesize_bytes'    : source_file_list[ relative_path ]['filesize_bytes']
+            }
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
 
-    print (f"\tSource manifest created for all {file_count} image files")
+    print (f"\tSource manifest created for all {len(source_file_list.keys())} image files")
 
     return {
         "operation_time_seconds"    : operation_time_seconds,
-        "source_manifest"           : source_manifests[list(source_dirs_info.keys())[0]],
+        "source_manifest"           : source_manifest,
     }
 
 
@@ -284,22 +285,33 @@ def _source_file_hash_worker( worker_index, source_file_queue, hash_queue, paren
             # No need to wait, the queue was pre-loaded by the parent
             curr_file_entry = source_file_queue.get(timeout=0.1)
         except queue.Empty:
-            if parent_done_writing.is_set():
+            # Test to see if the parent is done writing. If not, try again
+            if parent_done_writing.is_set() is False:
+                continue
+            else:
                 break
-        #print( f"Child got file {json.dumps(curr_file_entry, indent=4, sort_keys=True)}" )
-        with open( curr_file_entry['file_to_hash']['file_path']['absolute'], "rb") as file_to_hash_handle:
+
+        #print( f"Child {worker_index} got file info:\n{json.dumps(curr_file_entry, indent=4, sort_keys=True)}")
+
+        with open( curr_file_entry['absolute_path'], "rb") as file_to_hash_handle:
             file_bytes = file_to_hash_handle.read()
-            curr_file_entry['file_to_hash']['hashes'] = {
+            computed_hashes = {
                 #"sha3_384"  :   hashlib.sha3_384(file_bytes).hexdigest(),
                 "sha3_512"  :   hashlib.sha3_512(file_bytes).hexdigest(),
             }
 
-            hash_queue.put(
-                {
-                    "source_dir"    : curr_file_entry['source_dir'],
-                    "file_info"     : curr_file_entry['file_to_hash'],
-                }
-            )
+        hash_queue.put(
+            {
+                "paths": {
+                    "absolute": curr_file_entry['absolute_path'],
+                    "relative": curr_file_entry['relative_path'],
+                },
+
+                "hashes": computed_hashes,
+            }
+        )
+
+    #print( f"Child {worker_index} terminating cleanly" )
 
 
 def _extract_image_timestamps( program_options, source_image_manifest ):
@@ -336,7 +348,7 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
     for curr_file in source_image_files:
         exif_worker_data = {
             'paths'             : {
-                'absolute'          : os.path.join(program_options['source_dirs'][0], curr_file ),
+                'absolute'          : os.path.join(program_options['sourcedirs']['full'], curr_file ),
                 'relative'          : curr_file,
             },
             'manifest_data'     : source_image_manifest[curr_file],
@@ -351,7 +363,7 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
         source_image_manifest[ exif_timestamp_data['paths']['relative']]['timestamp'] = \
                 exif_timestamp_data['timestamp']
 
-    #logging.debug( f"Parent process has read out all {file_count} entries from results queue" )
+    logging.debug( f"Parent process has read out all {file_count} entries from results queue" )
 
     # Rejoin child threads
     while process_handles:
@@ -551,7 +563,7 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
             f"{file_data['timestamp'].year:4d}-{file_data['timestamp'].month:02d}-{file_data['timestamp'].day:02d}",
     }
 
-    #print( f"\tTrying to find unique destination filename for {date_components['year']}\{date_components['date_iso8601']}\{source_file}")
+    print( f"\tTrying to find unique destination filename for {date_components['year']}\{date_components['date_iso8601']}\{source_file}")
 
     if date_components['year'] not in destination_file_manifests:
         destination_file_manifests[ date_components['year']] = {}
@@ -596,7 +608,7 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
 
         test_filename = next_attempt_name
 
-    logging.debug( f"Found unique destination filename: {test_filename}")
+    print( f"Found unique destination filename: {test_filename}")
     # Mark the final location for this file
     file_data[ 'unique_destination_file_path' ] = os.path.join( date_components['year'],
                                                                 date_components['date_iso8601'],
@@ -621,6 +633,8 @@ def _set_destination_filenames( program_options, source_file_manifest, existing_
 
     print( "\nDetermining unique filenames in destination folder")
 
+    raise ValueError("Not actually detecting duplicates in destination directory anymore, what's up?")
+
     start_time = time.perf_counter()
 
     sorted_files = sorted(source_file_manifest.keys())
@@ -629,7 +643,6 @@ def _set_destination_filenames( program_options, source_file_manifest, existing_
 
     for curr_file in sorted_files:
         logging.debug(f"Getting size and unique destination filename for {curr_file}")
-        #logging.debug(f"\tSize: {file_size} bytes")
 
         _set_unique_destination_filename( curr_file, source_file_manifest[curr_file],
             program_options, existing_destination_files, destination_file_manifests )
@@ -647,7 +660,7 @@ def _set_destination_filenames( program_options, source_file_manifest, existing_
 
 def _do_file_copies_to_laptop( program_options, source_file_manifest ):
 
-    print( f"\nCopying files from source \"{program_options['source_dirs'][0]}\" to destination \"{program_options['laptop_destination_folder']}\"")
+    print( f"\nCopying files from source \"{program_options['sourcedirs']['full']}\" to destination \"{program_options['laptop_destination_folder']}\"")
 
     start_time = time.perf_counter()
 
@@ -670,7 +683,7 @@ def _do_file_copies_to_laptop( program_options, source_file_manifest ):
         # Attempt copy
         try:
             dest_path = os.path.join( program_options['laptop_destination_folder'], curr_file_entry['unique_destination_file_path'] )
-            source_absolute_path = os.path.join( program_options['source_dirs'][0], curr_source_file)
+            source_absolute_path = os.path.join( program_options['sourcedirs']['full'], curr_source_file)
             shutil.copyfile(source_absolute_path, dest_path)
             #print( f"\tCopied \"{source_absolute_path}\" -> \"{dest_path}\" successfully")
 
@@ -1014,54 +1027,56 @@ def _main():
     source_image_info = _enumerate_source_images(program_options)
     perf_timer.add_perf_timing( 'Enumerating source images', source_image_info['operation_time_seconds'])
 
-    print( "File list to create source manifest:\n" + json.dumps(source_image_info['file_list'], indent=4, sort_keys=True) )
+    #print( "File list to create source manifest:\n" + json.dumps(source_image_info['file_list'], indent=4, sort_keys=True) )
+    #print( "Reverse map for hashing:\n" + json.dumps(source_image_info['reverse_map'], indent=4) )
 
-    # manifest_info = _generate_source_manifest(source_image_info['source_dirs'])
-    # perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
-    # source_file_manifest = manifest_info['source_manifest']
-    #
-    # # Get timestamp for all image files
-    # timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
-    # perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
-    #
-    # # Geocode all images now that we know their timestamps
-    # geocode_images_results = _geocode_images( program_options, source_file_manifest )
-    # perf_timer.add_perf_timing( 'Geocoding images', geocode_images_results['operation_time_seconds'])
-    #
-    # # Enumerate files already in the destination directory
-    # destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
-    # perf_timer.add_perf_timing( "Listing existing files in destination folder",
-    #                             destination_files_results['operation_time_seconds'] )
-    # existing_destination_files = destination_files_results['existing_files']
-    #
-    # # Determine unique filenames
-    # set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest,
-    #                                                                 existing_destination_files )
-    # perf_timer.add_perf_timing( 'Generating unique destination filenames',
-    #                   set_destination_filenames_results['operation_time_seconds'] )
-    # destination_file_manifests = set_destination_filenames_results['destination_file_manifests']
-    #
-    # # Do file copies to laptop NVMe SSD
-    # copy_operation_results = _do_file_copies_to_laptop(program_options, source_file_manifest)
-    # perf_timer.add_perf_timing( 'Copying RAW files to laptop NVMe',
-    #                  copy_operation_results['operation_time_seconds'])
-    #
-    # # Do readback validation to make sure all writes to laptop worked
-    # print("\nReading files back from laptop SSD to verify contents still match original hash")
-    # verify_operation_results = _do_readback_validation( source_file_manifest, program_options )
-    # print( "\tDone")
-    # perf_timer.add_perf_timing( 'Validating all writes to laptop NVMe SSD are still byte-identical to source',
-    #     verify_operation_results['operation_time_seconds'])
-    #
-    # # Create XMP sidecar files
-    # print("\nCreating XMP sidecar files for all RAW images")
-    # xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
-    # print( "\tDone")
-    # perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
-    #
-    # # Update XMP sidecar files with geotags
-    # add_geotags_to_xmp_results = _add_geotags_to_xmp( destination_file_manifests, program_options )
-    # perf_timer.add_perf_timing( 'Adding geotags to XMP files', add_geotags_to_xmp_results['operation_time_seconds'] )
+    manifest_info = _generate_source_manifest( source_image_info['reverse_map'],
+                                               source_image_info['source_file_list'] )
+    perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
+    source_file_manifest = manifest_info['source_manifest']
+
+    # Get timestamp for all image files
+    timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
+    perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
+
+    # Geocode all images now that we know their timestamps
+    geocode_images_results = _geocode_images( program_options, source_file_manifest )
+    perf_timer.add_perf_timing( 'Geocoding images', geocode_images_results['operation_time_seconds'])
+
+    # Enumerate files already in the destination directory
+    destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
+    perf_timer.add_perf_timing( "Listing existing files in destination folder",
+                                destination_files_results['operation_time_seconds'] )
+    existing_destination_files = destination_files_results['existing_files']
+
+    # Determine unique filenames
+    set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest,
+                                                                    existing_destination_files )
+    perf_timer.add_perf_timing( 'Generating unique destination filenames',
+                      set_destination_filenames_results['operation_time_seconds'] )
+    destination_file_manifests = set_destination_filenames_results['destination_file_manifests']
+
+    # Do file copies to laptop NVMe SSD
+    copy_operation_results = _do_file_copies_to_laptop(program_options, source_file_manifest)
+    perf_timer.add_perf_timing( 'Copying RAW files to laptop NVMe',
+                     copy_operation_results['operation_time_seconds'])
+
+    # Do readback validation to make sure all writes to laptop worked
+    print("\nReading files back from laptop SSD to verify contents still match original hash")
+    verify_operation_results = _do_readback_validation( source_file_manifest, program_options )
+    print( "\tDone")
+    perf_timer.add_perf_timing( 'Validating all writes to laptop NVMe SSD are still byte-identical to source',
+        verify_operation_results['operation_time_seconds'])
+
+    # Create XMP sidecar files
+    print("\nCreating XMP sidecar files for all RAW images")
+    xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
+    print( "\tDone")
+    perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
+
+    # Update XMP sidecar files with geotags
+    add_geotags_to_xmp_results = _add_geotags_to_xmp( destination_file_manifests, program_options )
+    perf_timer.add_perf_timing( 'Adding geotags to XMP files', add_geotags_to_xmp_results['operation_time_seconds'] )
 
     # Pull geotags out of XMP and store in manifest
 
