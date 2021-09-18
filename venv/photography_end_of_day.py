@@ -202,6 +202,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     # Create dictionary with list of absolute paths per drive.  We are going to have one file reader per drive
     entries_by_drive = {}
 
+    total_file_count = len(reverse_file_map)
     for curr_absolute_path in reverse_file_map:
         file_drive = curr_absolute_path[:3]
         if file_drive not in entries_by_drive:
@@ -214,52 +215,48 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
             }
         )
 
+
     #print( "\tEntries by drive:\n" + json.dumps( entries_by_drive, indent=4, sort_keys=True) )
 
-    process_handles = []
+    # Queue that reader workers pass file contents over to hash workers
+    files_to_hash_queue = multiprocessing.Queue()
 
-    #  Queue for sending files needing timestamps to children
-    files_to_process_queue = multiprocessing.Queue()
+    # Queue that hash workers use to pass hash data back to parent
+    completed_files_queue = multiprocessing.Queue()
 
-    # Queue that children use to write hash data information data back to parent
-    file_hashes_queue = multiprocessing.Queue()
+    # Event to tell everyone when all the work is done
+    all_hashes_read = multiprocessing.Event()
 
-    # Event object that parent uses so children know when to exit
-    parent_done_writing = multiprocessing.Event()
-
-    for i in range( len(entries_by_drive.keys()) ):
-        process_handle = multiprocessing.Process( target=_source_file_hash_worker,
-                                                  args=(i+1, files_to_process_queue,
-                                                        file_hashes_queue,
-                                                        parent_done_writing) )
+    # Launch hash workers
+    hash_worker_handles = []
+    for i in range( multiprocessing.cpu_count() ):
+        process_handle = multiprocessing.Process( target=_hash_worker,
+                                                  args=(i+1, files_to_hash_queue,
+                                                        completed_files_queue,
+                                                        all_hashes_read) )
 
         process_handle.start()
-        logging.debug(f"Parent back from start on child process {i+1}")
-        process_handles.append( process_handle )
+        print(f"Parent back from start on hash worker {i+1}")
+        hash_worker_handles.append( process_handle )
 
-    # Load up the queue with all the files we want hashes of
-    file_count = 0
-    for curr_source_drive in sorted(entries_by_drive):
-        #print( f"\tSource drive: {curr_source_drive}")
+    reader_workers = []
+    for (i, drive_with_files_to_hash) in enumerate(entries_by_drive):
+        process_handle = multiprocessing.Process( target=_source_file_reader_worker,
+                                                  args=(i+1, entries_by_drive[drive_with_files_to_hash],
+                                                        files_to_hash_queue) )
 
-        for curr_file in entries_by_drive[curr_source_drive]:
-            #print( f"\t\tFile: {curr_file}")
+        process_handle.start()
+        print(f"Parent back from start on reader worker {i+1} with drive {drive_with_files_to_hash}")
+        reader_workers.append( process_handle )
 
-            files_to_process_queue.put( curr_file )
-
-        file_count += len( entries_by_drive[curr_source_drive] )
-
-    # Let the children know to not wait if queue is empty
-    parent_done_writing.set()
-
-    print( f"Parent done writing {file_count} entries to process queue")
+    print( f"Parent complete launching reader workers")
 
     source_manifest = {}
 
     # We know how many files we wrote into the queue that children read out of. Now read
     #   same number of entries out of the processed data queue
-    for i in range( file_count ):
-        file_hash_data = file_hashes_queue.get()
+    for i in range( total_file_count ):
+        file_hash_data = completed_files_queue.get()
         print(f"Parent got hash {i+1}")
 
         # If the relative path exists in the source manifest, make sure the hashes line up!
@@ -273,12 +270,21 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
                 'filesize_bytes'    : source_file_list[ relative_path ]['filesize_bytes']
             }
 
-    # Rejoin the children
+    # Signal that the hash workers can now terminate cleanly
+    print( "\tAll hashes read by parent, signaling hash workers to come home")
+    all_hashes_read.set()
+
+    # Rejoin all processes we spawned
     print( "Waiting for children to rejoin")
-    while process_handles:
-        curr_handle = process_handles.pop()
+    while reader_workers:
+        curr_handle = reader_workers.pop()
         curr_handle.join()
-    print("All children rejoined")
+    print("All reader workers rejoined")
+
+    while hash_worker_handles:
+        curr_handle = hash_worker_handles.pop()
+        curr_handle.join()
+    print("All hash  workers rejoined")
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -291,30 +297,40 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     }
 
 
-def _source_file_hash_worker( worker_index, source_file_queue, hash_queue, parent_done_writing ):
+def _source_file_reader_worker( reader_worker_index, drive_file_entries, file_contents_queue ):
+    for curr_file_entry in drive_file_entries:
+        with open(curr_file_entry['absolute_path'], "rb") as file_to_hash_handle:
+            file_bytes = file_to_hash_handle.read()
+
+            # Write out the contents for the hash workers to process
+            curr_file_entry['file_bytes'] = file_bytes
+            file_contents_queue.put( curr_file_entry )
+            # print( "Reader worker {0} complete with file {1}, moved to queue for hashing".format(
+            #     reader_worker_index, curr_file_entry['absolute_path']) )
+
+    print( f"Reader worker {reader_worker_index} terminating cleanly" )
+
+
+def _hash_worker( hash_worker_index, source_filecontents_queue, contents_hash_queue, all_hashes_read ):
     while True:
         try:
-            # No need to wait, the queue was pre-loaded by the parent
-            curr_file_entry = source_file_queue.get(timeout=0.1)
+            curr_file_entry = source_filecontents_queue.get(timeout=0.1)
         except queue.Empty:
-            # Test to see if the parent is done writing. If not, try again
-            if parent_done_writing.is_set() is False:
+            # Test to see if the parent has read all the data out, otherwise we're not done
+            if all_hashes_read.is_set() is False:
                 continue
             else:
                 break
 
         #print( f"Child {worker_index} got file info:\n{json.dumps(curr_file_entry, indent=4, sort_keys=True)}")
 
-        with open( curr_file_entry['absolute_path'], "rb") as file_to_hash_handle:
-            file_bytes = file_to_hash_handle.read()
-            computed_hashes = {
-                #"sha3_384"  :   hashlib.sha3_384(file_bytes).hexdigest(),
-                "sha3_512"  :   hashlib.sha3_512(file_bytes).hexdigest(),
-            }
+        computed_hashes = {
+            #"sha3_384"  :   hashlib.sha3_384(file_bytes).hexdigest(),
+            "sha3_512"  :   hashlib.sha3_512(curr_file_entry['file_bytes']).hexdigest(),
+        }
 
-        hash_queue.put(
+        contents_hash_queue.put(
             {
-                "type": "file_hash",
                 "paths": {
                     "absolute": curr_file_entry['absolute_path'],
                     "relative": curr_file_entry['relative_path'],
@@ -323,7 +339,7 @@ def _source_file_hash_worker( worker_index, source_file_queue, hash_queue, paren
             }
         )
 
-    #print( f"Child {worker_index} terminating cleanly" )
+    print( f"Hash worker {hash_worker_index} terminating cleanly" )
 
 
 def _extract_image_timestamps( program_options, source_image_manifest ):
@@ -353,7 +369,7 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
                                                         program_options) )
 
         process_handle.start()
-        #logging.debug(f"Parent back from start on child process {i+1}")
+        logging.debug(f"Parent back from start on timestamp child process {i+1}")
         process_handles.append( process_handle )
 
     # Load up the queue with all the files to process
