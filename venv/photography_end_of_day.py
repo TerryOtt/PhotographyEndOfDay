@@ -236,7 +236,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
                                                         all_hashes_read) )
 
         process_handle.start()
-        print(f"Parent back from start on hash worker {i+1}")
+        #print(f"Parent back from start on hash worker {i+1}")
         hash_worker_handles.append( process_handle )
 
     reader_workers = []
@@ -246,10 +246,10 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
                                                         files_to_hash_queue) )
 
         process_handle.start()
-        print(f"Parent back from start on reader worker {i+1} with drive {drive_with_files_to_hash}")
+        #print(f"Parent back from start on reader worker {i+1} with drive {drive_with_files_to_hash}")
         reader_workers.append( process_handle )
 
-    print( f"Parent complete launching reader workers")
+    #print( f"Parent complete launching reader workers")
 
     source_manifest = {}
 
@@ -257,12 +257,12 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     #   same number of entries out of the processed data queue
     for i in range( total_file_count ):
         file_hash_data = completed_files_queue.get()
-        print(f"Parent got hash {i+1}")
+        #print(f"Parent got hash {i+1}")
 
         # If the relative path exists in the source manifest, make sure the hashes line up!
         relative_path = file_hash_data['paths']['relative']
         if relative_path in source_manifest:
-            if file_hash_data['hashes'] != file_hash_data['hashes']:
+            if file_hash_data['hashes'] != source_manifest[relative_path]['hashes']:
                 raise ValueError( f"Got hash file mismatch on {relative_path}")
         else:
             source_manifest[ relative_path ] = {
@@ -271,20 +271,20 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
             }
 
     # Signal that the hash workers can now terminate cleanly
-    print( "\tAll hashes read by parent, signaling hash workers to come home")
+    #print( "\tAll hashes read by parent, signaling hash workers to come home")
     all_hashes_read.set()
 
     # Rejoin all processes we spawned
-    print( "Waiting for children to rejoin")
+    #print( "Waiting for children to rejoin")
     while reader_workers:
         curr_handle = reader_workers.pop()
         curr_handle.join()
-    print("All reader workers rejoined")
+    #print("All reader workers rejoined")
 
     while hash_worker_handles:
         curr_handle = hash_worker_handles.pop()
         curr_handle.join()
-    print("All hash  workers rejoined")
+    #print("All hash workers rejoined")
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -308,7 +308,7 @@ def _source_file_reader_worker( reader_worker_index, drive_file_entries, file_co
             # print( "Reader worker {0} complete with file {1}, moved to queue for hashing".format(
             #     reader_worker_index, curr_file_entry['absolute_path']) )
 
-    print( f"Reader worker {reader_worker_index} terminating cleanly" )
+    #print( f"Reader worker {reader_worker_index} terminating cleanly" )
 
 
 def _hash_worker( hash_worker_index, source_filecontents_queue, contents_hash_queue, all_hashes_read ):
@@ -329,6 +329,8 @@ def _hash_worker( hash_worker_index, source_filecontents_queue, contents_hash_qu
             "sha3_512"  :   hashlib.sha3_512(curr_file_entry['file_bytes']).hexdigest(),
         }
 
+        #print( f"{curr_file_entry['absolute_path']}: {computed_hashes['sha3_512']}")
+
         contents_hash_queue.put(
             {
                 "paths": {
@@ -339,7 +341,7 @@ def _hash_worker( hash_worker_index, source_filecontents_queue, contents_hash_qu
             }
         )
 
-    print( f"Hash worker {hash_worker_index} terminating cleanly" )
+    #print( f"Hash worker {hash_worker_index} terminating cleanly" )
 
 
 def _extract_image_timestamps( program_options, source_image_manifest ):
@@ -591,7 +593,9 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
             f"{file_data['timestamp'].year:4d}-{file_data['timestamp'].month:02d}-{file_data['timestamp'].day:02d}",
     }
 
-    print( f"\tTrying to find unique destination filename for {date_components['year']}\{date_components['date_iso8601']}\{source_file}")
+    #print( f"\tTrying to find unique destination filename for {date_components['year']}\{date_components['date_iso8601']}\{source_file}")
+
+    #print( "Existing destination files:\n" + json.dumps(existing_destination_files, indent=4, sort_keys=True))
 
     if date_components['year'] not in destination_file_manifests:
         destination_file_manifests[ date_components['year']] = {}
@@ -603,9 +607,12 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
     file_data['destination_subfolder'] = os.path.join( date_components['year'], date_components['date_iso8601'] )
 
     manifest_for_this_file = destination_file_manifests[ date_components['year'] ][ date_components['date_iso8601']]
+    existing_destination_files_in_dir = []
     if date_components['year'] in existing_destination_files and    \
             date_components['date_iso8601'] in existing_destination_files[date_components['year']]:
-        existing_destination_files_in_dir = existing_destination_files[ date_components['year'] ][ date_components['date_iso8601']]
+        for curr_existing_file in existing_destination_files[ date_components['year'] ][ date_components['date_iso8601']]:
+            # Get just the filename out
+            existing_destination_files_in_dir.append( os.path.basename( curr_existing_file) )
     else:
         print( "\tFound a file with a date not included in the existing destination files dictionary: " 
                f"\"{date_components['year']}\{date_components['date_iso8601']}\"" )
@@ -617,6 +624,8 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
 
         print("\tDone")
 
+    # print( f"Existing files in {date_components['year']}\{date_components['date_iso8601']}:\n" +
+    #     json.dumps( existing_destination_files_in_dir, indent=4, sort_keys=True) )
 
     # Find first filename that doesn't exist in the given destination manifest
     basename = os.path.basename( source_file )
@@ -636,7 +645,7 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
 
         test_filename = next_attempt_name
 
-    print( f"Found unique destination filename: {test_filename}")
+    #print( f"\t\tFound unique destination filename: {date_components['year']}\{date_components['date_iso8601']}\{test_filename}")
     # Mark the final location for this file
     file_data[ 'unique_destination_file_path' ] = os.path.join( date_components['year'],
                                                                 date_components['date_iso8601'],
@@ -755,7 +764,7 @@ def _do_readback_validation( source_file_manifest, program_options ):
             'filesize_bytes'    : curr_file_info['filesize_bytes'],
             'hashes'            : curr_file_info['hashes'],
         }
-        logging.debug(f"About to write {json.dumps(validation_worker_data)} to the child queue")
+        #print(f"About to write {json.dumps(validation_worker_data)} to the child queue")
         files_to_verify_queue.put(validation_worker_data)
 
     parent_done_writing.set()
@@ -785,12 +794,16 @@ def _validation_worker( worker_index, files_to_verify_queue, parent_done_writing
 
         #print( f"Child {worker_index} validating file {curr_file_entry['file_path']}")
 
+        #print( f"Full deets:\n" + json.dumps(curr_file_entry, indent=4, sort_keys=True) )
+
         with open( curr_file_entry['file_path'], "rb" ) as verify_file_handle:
             file_bytes = verify_file_handle.read()
-            if hashlib.sha3_512(file_bytes).hexdigest() != curr_file_entry['hashes']['sha3_512']:
+            computed_digest = hashlib.sha3_512(file_bytes).hexdigest()
+            if computed_digest != curr_file_entry['hashes']['sha3_512']:
                 print( f"FATAL: file {curr_file_entry['file_path']} does not have expected hash from manifest")
+                #print( f"Before copy: {curr_file_entry['hashes']['sha3_512']}\n After copy: {computed_digest}")
             else:
-                #print( f"{curr_file_entry['file_path']} passed its verify hash check")
+                #print( f"{curr_file_entry['file_path']} passed its verify hash check ({curr_file_entry['hashes']['sha3_512']})")
                 pass
 
     # Okay to just cleanly fall out and exit
