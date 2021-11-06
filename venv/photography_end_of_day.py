@@ -24,6 +24,8 @@ def _parse_args():
     arg_parser.add_argument("--debug", help="Lower logging level from INFO to DEBUG", action="store_true" )
     arg_parser.add_argument("--logfile", help="Path to file where the app log will be created",
                             default="photo_end_of_day.log" )
+    arg_parser.add_argument( "--singlethreaded", help="Disable multi-threading, do everything single threaded",
+                             action="store_true" )
     arg_parser.add_argument( "--sourcedir_full",
                              help="Path to a source directory with the *full* set of contents",
                              required=True )
@@ -199,26 +201,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
 
     print( "\nGenerating source manifest")
 
-    # Create dictionary with list of absolute paths per drive.  We are going to have one file reader per drive
-    entries_by_drive = {}
-
-    total_file_count = len(reverse_file_map)
-    for curr_absolute_path in reverse_file_map:
-        file_drive = curr_absolute_path[:3]
-        if file_drive not in entries_by_drive:
-            entries_by_drive[ file_drive ] = []
-
-        entries_by_drive[ file_drive ].append(
-            {
-                "absolute_path": curr_absolute_path,
-                "relative_path": reverse_file_map[curr_absolute_path],
-            }
-        )
-
-
-    #print( "\tEntries by drive:\n" + json.dumps( entries_by_drive, indent=4, sort_keys=True) )
-
-    # Queue that reader workers pass file contents over to hash workers
+    # Queue with filenames that hash workers will read and hash
     files_to_hash_queue = multiprocessing.Queue()
 
     # Queue that hash workers use to pass hash data back to parent
@@ -236,50 +219,72 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
                                                         all_hashes_read) )
 
         process_handle.start()
-        #print(f"Parent back from start on hash worker {i+1}")
+        print(f"Parent back from start on hash worker {i+1}")
         hash_worker_handles.append( process_handle )
-
-    reader_workers = []
-    for (i, drive_with_files_to_hash) in enumerate(entries_by_drive):
-        process_handle = multiprocessing.Process( target=_source_file_reader_worker,
-                                                  args=(i+1, entries_by_drive[drive_with_files_to_hash],
-                                                        files_to_hash_queue) )
-
-        process_handle.start()
-        #print(f"Parent back from start on reader worker {i+1} with drive {drive_with_files_to_hash}")
-        reader_workers.append( process_handle )
-
-    #print( f"Parent complete launching reader workers")
+    print( "All hash workers started" )
 
     source_manifest = {}
 
     # We know how many files we wrote into the queue that children read out of. Now read
     #   same number of entries out of the processed data queue
-    for i in range( total_file_count ):
-        file_hash_data = completed_files_queue.get()
-        #print(f"Parent got hash {i+1}")
+    hashes_received = 0
+    #pprint.pprint( source_file_list)
+    #return
+    total_file_count = len(source_file_list.keys())
+    filenames_left_to_send = total_file_count
+    sorted_absolute_path_list = list( reverse_file_map.keys() )
+    sorted_absolute_path_list.sort()
+    while hashes_received < total_file_count:
+        # Populate the filename hash list
+        filenames_to_send = min( filenames_left_to_send, multiprocessing.cpu_count() )
+        for i in range( filenames_to_send ):
+            curr_absolute_path = sorted_absolute_path_list.pop()
+            files_to_hash_queue.put(
+                {
+                    'paths': {
+                        'absolute': curr_absolute_path,
+                        'relative': reverse_file_map[ curr_absolute_path ]
+                    }
+                }
+            )
+            filenames_left_to_send -= 1
+            #print( "Sent filename")
 
-        # If the relative path exists in the source manifest, make sure the hashes line up!
-        relative_path = file_hash_data['paths']['relative']
-        if relative_path in source_manifest:
-            if file_hash_data['hashes'] != source_manifest[relative_path]['hashes']:
-                raise ValueError( f"Got hash file mismatch on {relative_path}")
-        else:
-            source_manifest[ relative_path ] = {
-                'hashes': file_hash_data['hashes'],
-                'filesize_bytes'    : source_file_list[ relative_path ]['filesize_bytes']
-            }
+        # Read from completed queue until empty, that'll keep workers busy
+        if hashes_received < total_file_count:
+            while True:
+                # Read the completed queue
+                try:
+                    file_hash_data = completed_files_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+                # If the relative path exists in the source manifest, make sure the hashes line up!
+                relative_path = file_hash_data['paths']['relative']
+                if relative_path in source_manifest:
+                    if file_hash_data['hashes'] != source_manifest[relative_path]['hashes']:
+                        raise ValueError( f"Got hash file mismatch on {relative_path}")
+                else:
+                    source_manifest[ relative_path ] = {
+                        'hashes': file_hash_data['hashes'],
+                        'filesize_bytes'    : source_file_list[ relative_path ]['filesize_bytes']
+                    }
+
+                hashes_received += 1
+                #print( f"Parent got hash {hashes_received}" )
+
+                # Can now delete from reverse map, no longer needed
+                del reverse_file_map[ file_hash_data['paths']['absolute'] ]
+                file_hash_data = None
+        #print("Parent done with iteration of reading hash results, going to try sending more data")
+
+    #print( "Parent done reading and writing from queues")
 
     # Signal that the hash workers can now terminate cleanly
     #print( "\tAll hashes read by parent, signaling hash workers to come home")
     all_hashes_read.set()
 
     # Rejoin all processes we spawned
-    #print( "Waiting for children to rejoin")
-    while reader_workers:
-        curr_handle = reader_workers.pop()
-        curr_handle.join()
-    #print("All reader workers rejoined")
 
     while hash_worker_handles:
         curr_handle = hash_worker_handles.pop()
@@ -297,19 +302,6 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     }
 
 
-def _source_file_reader_worker( reader_worker_index, drive_file_entries, file_contents_queue ):
-    for curr_file_entry in drive_file_entries:
-        with open(curr_file_entry['absolute_path'], "rb") as file_to_hash_handle:
-            file_bytes = file_to_hash_handle.read()
-
-            # Write out the contents for the hash workers to process
-            curr_file_entry['file_bytes'] = file_bytes
-            file_contents_queue.put( curr_file_entry )
-            # print( "Reader worker {0} complete with file {1}, moved to queue for hashing".format(
-            #     reader_worker_index, curr_file_entry['absolute_path']) )
-
-    #print( f"Reader worker {reader_worker_index} terminating cleanly" )
-
 
 def _hash_worker( hash_worker_index, source_filecontents_queue, contents_hash_queue, all_hashes_read ):
     while True:
@@ -322,24 +314,27 @@ def _hash_worker( hash_worker_index, source_filecontents_queue, contents_hash_qu
             else:
                 break
 
+        with open( curr_file_entry['paths']['absolute'], "rb") as file_handle:
+            file_bytes = file_handle.read()
+
         #print( f"Child {worker_index} got file info:\n{json.dumps(curr_file_entry, indent=4, sort_keys=True)}")
 
         computed_hashes = {
             #"sha3_384"  :   hashlib.sha3_384(file_bytes).hexdigest(),
-            "sha3_512"  :   hashlib.sha3_512(curr_file_entry['file_bytes']).hexdigest(),
+            "sha3_512"  :   hashlib.sha3_512(file_bytes).hexdigest(),
         }
 
         #print( f"{curr_file_entry['absolute_path']}: {computed_hashes['sha3_512']}")
 
         contents_hash_queue.put(
             {
-                "paths": {
-                    "absolute": curr_file_entry['absolute_path'],
-                    "relative": curr_file_entry['relative_path'],
-                },
+                "paths":  curr_file_entry['paths'],
                 "hashes": computed_hashes,
             }
         )
+
+        # Release our reference to the file entry
+        curr_file_entry = None
 
     #print( f"Hash worker {hash_worker_index} terminating cleanly" )
 
@@ -1073,6 +1068,8 @@ def _main():
 
     manifest_info = _generate_source_manifest( source_image_info['reverse_map'],
                                                source_image_info['source_file_list'] )
+    # Delete the reverse map, don't need it anymore
+    del source_image_info['reverse_map']
     perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
     source_file_manifest = manifest_info['source_manifest']
 
