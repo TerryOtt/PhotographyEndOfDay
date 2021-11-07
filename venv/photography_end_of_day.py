@@ -1,4 +1,4 @@
-import pprint
+# import pprint
 import json
 import logging
 import argparse
@@ -12,11 +12,12 @@ import datetime
 import shutil
 import pathlib
 import glob
-import tempfile
-import zipfile
+# import tempfile
+# import zipfile
 import performance_timer
 import gpxpy
-import xml.etree.ElementTree
+# import xml.etree.ElementTree
+import random
 
 
 def _parse_args():
@@ -110,7 +111,7 @@ def _enumerate_source_images(program_options):
 
     curr_handle.start()
     print(f"\tScanning \"{program_options['sourcedirs']['full']}\" for RAW image files with extension " +
-          f".\"{program_options['file_extension']}\" (full contents)")
+          f"\".{program_options['file_extension']}\" (full contents)")
 
     process_handles.append(curr_handle)
 
@@ -219,26 +220,36 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
                                                         all_hashes_read) )
 
         process_handle.start()
-        print(f"Parent back from start on hash worker {i+1}")
+        #print(f"Parent back from start on hash worker {i+1}")
         hash_worker_handles.append( process_handle )
-    print( "All hash workers started" )
+    #print( "All hash workers started" )
 
     source_manifest = {}
+
+    # # Ahhh think I know. We set total hash count expected incorrectly.  need to do that based on reverse map
+    # print( f"\tReverse map (all copies of all files) has {len(reverse_file_map.keys())} entries")
+    # return
 
     # We know how many files we wrote into the queue that children read out of. Now read
     #   same number of entries out of the processed data queue
     hashes_received = 0
     #pprint.pprint( source_file_list)
     #return
-    total_file_count = len(source_file_list.keys())
-    filenames_left_to_send = total_file_count
-    sorted_absolute_path_list = list( reverse_file_map.keys() )
-    sorted_absolute_path_list.sort()
-    while hashes_received < total_file_count:
+    total_hash_count = len(reverse_file_map.keys())
+    filenames_left_to_send = total_hash_count
+
+    # We shuffle this list to ensure that we pull files from all source drives equally without needing to
+    #       create lists of which files are on which drives. Easier and same end effect
+    shuffled_absolute_path_list = list( reverse_file_map.keys() )
+    random.shuffle( shuffled_absolute_path_list )
+
+    total_file_count = len( source_file_list.keys() )
+    #print( f"\tHashing {total_hash_count} files in order to confirm all copies of {total_file_count} manifest entries match")
+    while hashes_received < total_hash_count:
         # Populate the filename hash list
         filenames_to_send = min( filenames_left_to_send, multiprocessing.cpu_count() )
         for i in range( filenames_to_send ):
-            curr_absolute_path = sorted_absolute_path_list.pop()
+            curr_absolute_path = shuffled_absolute_path_list.pop()
             files_to_hash_queue.put(
                 {
                     'paths': {
@@ -251,7 +262,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
             #print( "Sent filename")
 
         # Read from completed queue until empty, that'll keep workers busy
-        if hashes_received < total_file_count:
+        if hashes_received < total_hash_count:
             while True:
                 # Read the completed queue
                 try:
@@ -266,12 +277,12 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
                         raise ValueError( f"Got hash file mismatch on {relative_path}")
                 else:
                     source_manifest[ relative_path ] = {
-                        'hashes': file_hash_data['hashes'],
+                        'hashes'            : file_hash_data['hashes'],
                         'filesize_bytes'    : source_file_list[ relative_path ]['filesize_bytes']
                     }
 
                 hashes_received += 1
-                #print( f"Parent got hash {hashes_received}" )
+                #print( f"\tParent got hash {hashes_received}" )
 
                 # Can now delete from reverse map, no longer needed
                 del reverse_file_map[ file_hash_data['paths']['absolute'] ]
@@ -279,6 +290,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
         #print("Parent done with iteration of reading hash results, going to try sending more data")
 
     #print( "Parent done reading and writing from queues")
+    #print( f"\tGot {len(source_manifest.keys())} unique relative file paths out of total of {total_hash_count} source files")
 
     # Signal that the hash workers can now terminate cleanly
     #print( "\tAll hashes read by parent, signaling hash workers to come home")
@@ -294,7 +306,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
 
-    print (f"\tSource manifest created for all {len(source_file_list.keys())} image files")
+    print (f"\tSource manifest created for all {total_file_count} unique image files, computed from {total_hash_count} separate files to make sure all copies match")
 
     return {
         "operation_time_seconds"    : operation_time_seconds,
@@ -1072,6 +1084,10 @@ def _main():
     del source_image_info['reverse_map']
     perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
     source_file_manifest = manifest_info['source_manifest']
+    # How many files in the source manifest - is this where we dropped files?  yes, it is
+    #print( f"\tNumber of files tracked in source file list: {len(source_image_info['source_file_list'])}" )
+    #print( f"\tNumber of files in source manifest: {len(list(source_file_manifest))}")
+    #print( f"\tNumber of files in source manifest: {len(list(source_file_manifest))}")
 
     # Get timestamp for all image files
     timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
