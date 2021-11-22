@@ -881,22 +881,27 @@ def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_
     #print( "Child exiting cleanly")
 
 
-def _copy_to_external_storage_worker( program_otions, curr_travel_storage_media_folder, source_file_manifest):
-    pass
+def _copy_to_external_storage_worker( program_options, curr_travel_storage_media_folder, source_file_manifest):
+    print( f"\tCreating travel media storage copy at \"{curr_travel_storage_media_folder}\"" )
+    shutil.copytree( program_options['laptop_destination_folder'], curr_travel_storage_media_folder,
+                     dirs_exist_ok=True)
+    print( f"\tTravel media storage copy \"{curr_travel_storage_media_folder}\" created successfully")
+
 
 def _copy_files_to_external_storage( program_options, source_file_manifest ):
     print( "\nCopying staged files from laptop NVMe to external storage travel media")
 
     start_time = time.perf_counter()
     process_handles = []
-    for curr_travel_storage_media_folder in program_options.travel_storage_media_folder:
+    #print( "Program options: " + json.dumps(program_options, indent=4, sort_keys=True) )
+    for curr_travel_storage_media_folder in program_options['travel_storage_media_folders']:
 
         copy_process_handle = multiprocessing.Process(target=_copy_to_external_storage_worker,
                                              args=(program_options,
                                                    curr_travel_storage_media_folder,
                                                    source_file_manifest))
         copy_process_handle.start()
-        print(f"\tStarted copy of staged files to external travel storage media folder \"{curr_travel_storage_media_folder}\" ")
+        #print(f"\tStarted copy of staged files to external travel storage media folder \"{curr_travel_storage_media_folder}\" ")
 
         process_handles.append(copy_process_handle)
 
@@ -983,10 +988,36 @@ def _update_manifest_with_geotags( program_options, destination_file_manifests )
                     computed_digest = hashlib.sha3_512(file_bytes).hexdigest()
                     curr_manifest_entry['xmp']['sha3_512'] = computed_digest
 
-                print( f"Updated manifest entry for {curr_year_folder}\{curr_date_folder}\{curr_manifest_filename}:")
-                print( json.dumps(curr_manifest_entry, indent=4, sort_keys=True, default=str) )
+                #print( f"Updated manifest entry for {curr_year_folder}\{curr_date_folder}\{curr_manifest_filename}:")
+                #print( json.dumps(curr_manifest_entry, indent=4, sort_keys=True, default=str) )
 
-                break
+    end_time = time.perf_counter()
+    operation_time_seconds = end_time - start_time
+
+    return {
+        'operation_time_seconds': operation_time_seconds,
+    }
+
+def _write_manifest_files( program_options, destination_file_manifests ):
+    start_time = time.perf_counter()
+
+    for curr_year_folder in sorted( destination_file_manifests ):
+        for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
+            curr_day_manifest = destination_file_manifests[curr_year_folder][curr_date_folder]
+
+            # See if there's an existing manifest for that date, if so, read it in and merge it with our manifest
+            target_manifest_path = os.path.join( program_options['laptop_destination_folder'],
+                                             curr_year_folder,
+                                             curr_date_folder,
+                                             f"tdo_photo_manifest_{curr_date_folder}.json" )
+            if os.path.isfile( target_manifest_path ):
+                with open( target_manifest_path, "r") as existing_manifest_handle:
+                    existing_manifest = json.load( existing_manifest_handle )
+                curr_day_manifest.update( existing_manifest )
+
+            with open( target_manifest_path, "w" ) as new_or_updated_manifest_handle:
+                json.dump( curr_day_manifest, new_or_updated_manifest_handle, indent=4, sort_keys=True,
+                           default=str)
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -1015,6 +1046,7 @@ def _main():
     program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
     program_options['gpx_file_folder'] = args.gpx_file_folder
     program_options['laptop_destination_folder'] = args.laptop_destination_folder
+    program_options['travel_storage_media_folders'] = args.travel_storage_media_folder
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
@@ -1073,51 +1105,23 @@ def _main():
     perf_timer.add_perf_timing(  'Generating geotagged XMP files', xmp_generation_results['operation_time_seconds'])
 
     # Pull geotags out of XMP and store in manifest
-    print( "\nUpdating manifest with geotag data")
+    print( "\nUpdating manifest with geotag and XMP hash data")
     geotag_and_timestamp_manifest_update_results = _update_manifest_with_geotags( program_options,
                                                                                   destination_file_manifests )
     print( "\tDone" )
-    perf_timer.add_perf_timing( "Updating manifest with geotags", geotag_and_timestamp_manifest_update_results['operation_time_seconds'])
+    perf_timer.add_perf_timing( "Adding geotags and XMP file hashes to manifest", geotag_and_timestamp_manifest_update_results['operation_time_seconds'])
 
-    # Write manifest files to each date dir in scratch
-
-    # Add checksums for XMP files to manifest
-    # xmp_checksum_time_seconds = _add_xmp_file_checksums_to_manifest( program_options, source_file_manifest )
-    # perf_timer.add_perf_timing( "Adding XMP file checksums to manifest", xmp_checksum_time_seconds )
+    # Create (or update) daily manifest files
+    print( "\nWriting or updating per-day manifest files" )
+    manifest_write_results = _write_manifest_files( program_options, destination_file_manifests )
+    print( "\tDone")
+    perf_timer.add_perf_timing( "Writing per-day manifest files to disk",
+                                manifest_write_results['operation_time_seconds'] )
 
     # Copy from laptop to external storage
-    # external_copies_time_seconds = _copy_files_to_external_storage( program_options, source_file_manifest )
-    # perf_timer.add_perf_timing( 'Copying all files from laptop to all travel storage media devices',
-    #                             external_copies_time_seconds )
-
-    # TODO: need to read back from external storage and run checksums to make sure all writes to external media worked
-
-    # ZIP up the entire day in scratch storage (no compression!)
-    # zipfile_path = os.path.join( "e:\\", "test.zip" )
-    # print(f"\nCreating zip file {zipfile_path}")
-    # zip_file = zipfile.ZipFile( zipfile_path, mode='w' )
-    #
-    # for  curr_year in sorted(destination_file_manifests):
-    #     for  curr_date in sorted(destination_file_manifests[curr_year]):
-    #         curr_manifest = destination_file_manifests[curr_year][curr_date]
-    #         # print( f"Processing manifest for {curr_date_folder}" )
-    #         for curr_manifest_filename in sorted(curr_manifest):
-    #             curr_file_info = curr_manifest[curr_manifest_filename]
-    #             #print( json.dumps( curr_file_info, indent=4, sort_keys=True, default=str) )
-    #             file_to_add = os.path.join( scratch_write_tempdir.name, curr_year, curr_date, curr_manifest_filename )
-    #             zip_file.write( file_to_add )
-    #
-    # print(f"\tZip file {zipfile_path} created")
-
-    # Take hashes of each ZIP file
-
-    # Do test unzip to scratch
-
-    # Compare files extracted from ZIP match hashes in manifest
-
-    # Do copy of known-good ZIP to each trip capacity storage device (e.g., SanDisk Extreme Pro V2 4TB SSD)
-
-    # Check hash of ZIP file on each trip capacity storage device
+    external_copies_time_seconds = _copy_files_to_external_storage( program_options, source_file_manifest )
+    perf_timer.add_perf_timing( 'Copying all files from laptop to all travel storage media devices',
+                                 external_copies_time_seconds )
 
 
     # Final perf print
