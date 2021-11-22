@@ -15,6 +15,7 @@ import glob
 import performance_timer
 import random
 import shutil
+import xml.etree.ElementTree
 
 
 def _parse_args():
@@ -601,9 +602,11 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
 
     # Record the XMP filename for this destination file
     (filename_no_extension, filename_extension) = os.path.splitext( test_filename )
-    file_data[ 'destination_xmp_file' ] = os.path.join( date_components['year'],
-                                                       date_components['date_iso8601'],
-                                                       f"{filename_no_extension}.xmp" )
+    file_data[ 'xmp' ] = {
+        'filename': os.path.join( date_components['year'],
+                                  date_components['date_iso8601'],
+                                  f"{filename_no_extension}.xmp" ),
+    }
 
     # Update destination manifest
     manifest_for_this_file[ test_filename ] = file_data
@@ -909,6 +912,89 @@ def _copy_files_to_external_storage( program_options, source_file_manifest ):
 
     return operation_time_seconds
 
+
+def _update_manifest_with_geotags( program_options, destination_file_manifests ):
+    start_time = time.perf_counter()
+
+    for curr_year_folder in sorted( destination_file_manifests ):
+        for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
+            for curr_manifest_filename in sorted( destination_file_manifests[ curr_year_folder ][curr_date_folder] ):
+
+                curr_manifest_entry = destination_file_manifests[curr_year_folder][curr_date_folder][curr_manifest_filename]
+                xmp_path = os.path.join(program_options['laptop_destination_folder'],
+                                        curr_manifest_entry['xmp']['filename'])
+
+                # Pull the geotags out of the XMP file
+                xmp_tree = xml.etree.ElementTree.parse(xmp_path)
+                root = xmp_tree.getroot()
+
+                xml_namespaces = {
+                    'exif'  : 'http://ns.adobe.com/exif/1.0/',
+                }
+                gps_alt = root.find( ".//exif:GPSAltitude", xml_namespaces)
+                gps_lat = root.find( ".//exif:GPSLatitude", xml_namespaces)
+                gps_lon = root.find( ".//exif:GPSLongitude", xml_namespaces )
+
+                # Make readable versions of the geotag data, as it's... not great
+                (alt_numerator, alt_denominator) = gps_alt.text.split( "/" )
+                alt_numerator = int( alt_numerator )
+                alt_denominator = int( alt_denominator )
+
+                latitude_hemisphere = gps_lat.text[-1]
+                if latitude_hemisphere == "N":
+                    latitude_multiplier = 1
+                elif latitude_hemisphere == "S":
+                    latitude_multiplier = -1
+                else:
+                    raise ValueError("Invalid latitude hemisphere, neither N nor S")
+
+                (lat_degrees, lat_minutes) = gps_lat.text.split( ",")
+                readable_lat = latitude_multiplier * (int(lat_degrees) + (float(lat_minutes[:-1]) / 60.0))
+
+                longitude_hemisphere = gps_lon.text[-1]
+                if longitude_hemisphere == "W":
+                    longitude_multiplier = -1
+                elif longitude_hemisphere == "E":
+                    longitude_multiplier = 1
+                else:
+                    raise ValueError("Invalid longitude hemisphere, neither W nor E")
+                (lon_degrees, lon_minutes) = gps_lon.text.split(",")
+                readable_lon = longitude_multiplier * (int(lon_degrees) + (float(lon_minutes[:-1]) / 60.0))
+
+                curr_manifest_entry[ 'geotag_info'] = {
+                    'latitude'  : {
+                        'value'     : str(round(readable_lat, 6)),
+                        'unit'      : "WGS84 degrees",
+                    },
+                    'longitude' : {
+                        'value'     : str(round(readable_lon, 6)),
+                        'unit'      : "WGS84 degrees",
+                    },
+                    'altitude'  : {
+                        'value'     : str(round(alt_numerator / alt_denominator, 2)),
+                        'unit'      : 'meters above sea level',
+                    }
+                }
+
+                # Create a hash of the XMP file and store it in the manifest
+
+                with open(xmp_path, "rb") as xmp_file_handle:
+                    file_bytes = xmp_file_handle.read()
+                    computed_digest = hashlib.sha3_512(file_bytes).hexdigest()
+                    curr_manifest_entry['xmp']['sha3_512'] = computed_digest
+
+                print( f"Updated manifest entry for {curr_year_folder}\{curr_date_folder}\{curr_manifest_filename}:")
+                print( json.dumps(curr_manifest_entry, indent=4, sort_keys=True, default=str) )
+
+                break
+
+    end_time = time.perf_counter()
+    operation_time_seconds = end_time - start_time
+
+    return {
+        'operation_time_seconds': operation_time_seconds,
+    }
+
 def _main():
     args = _parse_args()
     program_options = {}
@@ -984,11 +1070,20 @@ def _main():
     print("\nCreating geotagged XMP sidecar files for all RAW images")
     xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
     print( "\tDone")
-    perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
+    perf_timer.add_perf_timing(  'Generating geotagged XMP files', xmp_generation_results['operation_time_seconds'])
 
     # Pull geotags out of XMP and store in manifest
+    print( "\nUpdating manifest with geotag data")
+    geotag_and_timestamp_manifest_update_results = _update_manifest_with_geotags( program_options,
+                                                                                  destination_file_manifests )
+    print( "\tDone" )
+    perf_timer.add_perf_timing( "Updating manifest with geotags", geotag_and_timestamp_manifest_update_results['operation_time_seconds'])
 
     # Write manifest files to each date dir in scratch
+
+    # Add checksums for XMP files to manifest
+    # xmp_checksum_time_seconds = _add_xmp_file_checksums_to_manifest( program_options, source_file_manifest )
+    # perf_timer.add_perf_timing( "Adding XMP file checksums to manifest", xmp_checksum_time_seconds )
 
     # Copy from laptop to external storage
     # external_copies_time_seconds = _copy_files_to_external_storage( program_options, source_file_manifest )
