@@ -12,12 +12,9 @@ import datetime
 import shutil
 import pathlib
 import glob
-# import tempfile
-# import zipfile
 import performance_timer
-import gpxpy
-# import xml.etree.ElementTree
 import random
+import shutil
 
 
 def _parse_args():
@@ -36,12 +33,14 @@ def _parse_args():
                              help="Path to a source directory with a *partial* set of the contents",
                              action="append")
     arg_parser.add_argument( "fileext", help="File extension, e.g. \"NEF\", \"CR3\""  )
-    arg_parser.add_argument( "exiftool", help="Path to the exiftool utility" )
     arg_parser.add_argument("file_timestamp_utc_offset_hours",
                             help="Hours offset from UTC, e.g. EDT is -4, Afghanistan is +4.5",
                             type=float)
     arg_parser.add_argument( "gpx_file_folder", help="Path to folder with all GPX files for these pictures")
     arg_parser.add_argument( "laptop_destination_folder", help="Path to storage folder on laptop NVMe" )
+    arg_parser.add_argument( "travel_storage_media_folder", nargs="+",
+                             help="External travel storage media folder " + \
+                                  "(e.g., SanDisk Extreme Pro 4TB, WD My Passport 4TB)")
 
     return arg_parser.parse_args()
 
@@ -427,7 +426,7 @@ def _exif_timestamp_worker( child_process_index, files_to_process_queue, process
 
     exiftool_tag_name = "EXIF:DateTimeOriginal"
 
-    with exiftool.ExifTool(program_options['exiftool_path']) as exiftool_handle:
+    with exiftool.ExifTool() as exiftool_handle:
 
         while True:
             try:
@@ -468,64 +467,6 @@ def _exif_timestamp_worker( child_process_index, files_to_process_queue, process
 
 
     #print( f"Child {child_process_index} exiting cleanly")
-
-
-def _geocode_images( program_options, source_file_manifests ):
-    print( "\nGeocoding images" )
-
-    time_start = time.perf_counter()
-
-    print( "\tReading GPX files" )
-
-    gpx_file_wildcard = os.path.join( program_options['gpx_file_folder'], '*.gpx' )
-    gpx_files = glob.glob( gpx_file_wildcard )
-
-    gpx_file_data = []
-
-    for curr_gpx_file in gpx_files:
-        with open( curr_gpx_file, "r" ) as gpx_file_handle:
-            gpx_data = gpxpy.parse( gpx_file_handle )
-            gpx_file_data.append( gpx_data )
-
-    #print("\tGPX file parsing complete")
-
-    feet_in_one_meter = 3.28084
-
-    print("\tGeotagging all images")
-    for curr_file_name in source_file_manifests:
-        #print( f"\t\tTrying to geocode {curr_file_name}")
-        #print( "image data:\n" + json.dumps(source_file_manifests[curr_file_name], indent=4, sort_keys=True, default=str))
-
-        curr_file_data = source_file_manifests[curr_file_name]
-        curr_timestamp = curr_file_data['timestamp']
-        for curr_gpx_data in gpx_file_data:
-            computed_location = curr_gpx_data.get_location_at( curr_timestamp )
-            if computed_location:
-                location_info = {
-                    'latitude_wgs84_degrees': computed_location[0].latitude,
-                    'longitude_wgs84_degrees'             : computed_location[0].longitude,
-                    'elevation_above_sea_level'     : {
-                        'meters'    : computed_location[0].elevation,
-                        'feet'      : computed_location[0].elevation * feet_in_one_meter,
-                    },
-                }
-
-                curr_file_data['geotag'] = location_info
-            else:
-                #print( "\tlocation not found")
-                pass
-
-        if 'geotag' not in curr_file_data:
-            print( f"\tINFO: no location was found in GPX files for {curr_file_name}" )
-
-    time_end = time.perf_counter()
-    operation_time_seconds = time_end - time_start
-
-    #print("\tAll images geocoded" )
-
-    return {
-        'operation_time_seconds': operation_time_seconds,
-    }
 
 
 def _get_existing_files_in_destination( source_file_manifest, program_options ):
@@ -870,12 +811,9 @@ def _create_xmp_files( destination_file_manifests, program_options ):
 
 
 def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_done_writing, program_options ):
+    gpx_wildcard = os.path.join(program_options['gpx_file_folder'], "*.gpx")
 
-    with exiftool.ExifTool(program_options['exiftool_path']) as exiftool_handle:
-
-        # Create geotag parameters as those won't change
-        geotag_parameters = []
-
+    with exiftool.ExifTool() as exiftool_handle:
         while True:
             try:
                 # No need to wait, the queue was pre-loaded by the parent
@@ -896,30 +834,6 @@ def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_
                                               curr_image_to_create_xmp_for['year'],
                                               curr_image_to_create_xmp_for['date'], f"{filename_no_extension}.xmp" )
 
-            # Yeah, geotagging with Exiftool is a nonstarter. Just too much hassle. I could do it at commandline,
-            #   But when trying to do with the pyexiftool wrapper it lacked GPS coords.  I give up.
-
-            # Finally got what looks like a sane XMP with:
-            # "c:\Program Files (x86)\ExifTool\exiftool.exe" -geotag utah.gpx "-geotime<${DateTimeOriginal}-08:00" 694A0001.CR3 -o %d%f.xmp
-
-            # Had to do -8:00 because we took it in -0600 but I had the clock set two hours behind because 24 hour clock math is hard
-
-            # Generated XMP
-            # <?xpacket begin='﻿' id='W5M0MpCehiHzreSzNTczkc9d'?>
-            # <x:xmpmeta xmlns:x='adobe:ns:meta/' x:xmptk='Image::ExifTool 12.30'>
-            # <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
-            #
-            #  <rdf:Description rdf:about=''
-            #   xmlns:exif='http://ns.adobe.com/exif/1.0/'>
-            #   <exif:GPSAltitude>128147/100</exif:GPSAltitude>
-            #   <exif:GPSAltitudeRef>0</exif:GPSAltitudeRef>
-            #   <exif:GPSLatitude>41,3.772866N</exif:GPSLatitude>
-            #   <exif:GPSLongitude>112,14.433294W</exif:GPSLongitude>
-            #  </rdf:Description>
-            # </rdf:RDF>
-            # </x:xmpmeta>
-            # <?xpacket end='w'?>
-
             exiftool_parameters= (
                 # Point it towards the RAW file we want an XMP file for
                 exiftool.fsencode(raw_file_absolute_path),
@@ -936,115 +850,64 @@ def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_
 
             #print( "Exiftool execute results:\n" + execute_output.decode() )
 
+            # Now adding geotags to the XMP file -- note we're making the first stage XMP our source,
+            #   not the RAW image -- we don't want to write tags to the RAW file, just the XMP
+            exiftool_params = (
+                #"-v2".encode(),
+                "-geotag".encode(),
+                gpx_wildcard.encode(),
+                "-geotime<${DateTimeOriginal}+00:00".encode(),
+                exiftool.fsencode( expected_xmp_file ),
+                "-o".encode(),
+                "%d%f_geocode.xmp".encode(),
+            )
+
+            execute_output = exiftool_handle.execute(*exiftool_params)
+            #print(f"\t\tGeotagged into {basename_minus_ext}_geocode.xmp\n")
+            #print( f"Output:{execute_output.decode()}")
+
+            # Now overwrite the first XMP file with the geotagged version
+            geocoded_xmp_path = os.path.join( program_options['laptop_destination_folder'],
+                                              curr_image_to_create_xmp_for['year'],
+                                              curr_image_to_create_xmp_for['date'],
+                                              f"{filename_no_extension}_geocode.xmp" )
+
+            shutil.move( geocoded_xmp_path, expected_xmp_file )
+
+
     #print( "Child exiting cleanly")
 
 
-def _add_geotags_to_xmp( destination_file_manifests, program_options ):
-    print( "\nAdding geotags to XMP files")
+def _copy_to_external_storage_worker( program_otions, curr_travel_storage_media_folder, source_file_manifest):
+    pass
+
+def _copy_files_to_external_storage( program_options, source_file_manifest ):
+    print( "\nCopying staged files from laptop NVMe to external storage travel media")
 
     start_time = time.perf_counter()
+    process_handles = []
+    for curr_travel_storage_media_folder in program_options.travel_storage_media_folder:
 
-    for curr_year in sorted(destination_file_manifests):
-        for curr_date in sorted(destination_file_manifests[curr_year]):
-            for curr_file in sorted(destination_file_manifests[curr_year][curr_date]):
-                curr_image_data = destination_file_manifests[curr_year][curr_date][curr_file]
-                #print( f"\tAdding geotag for {curr_file}" )
-                #print( "\tFile info from manifest for this file: " + json.dumps(curr_image_data, indent=4, sort_keys=True, default=str) )
+        copy_process_handle = multiprocessing.Process(target=_copy_to_external_storage_worker,
+                                             args=(program_options,
+                                                   curr_travel_storage_media_folder,
+                                                   source_file_manifest))
+        copy_process_handle.start()
+        print(f"\tStarted copy of staged files to external travel storage media folder \"{curr_travel_storage_media_folder}\" ")
 
-                if 'geotag' in curr_image_data:
-                    geotag_data = curr_image_data['geotag']
+        process_handles.append(copy_process_handle)
 
-                    #print( "Going to insert geotag data into EXIF data of XMP file: " + \
-                    #    json.dumps(geotag_data, sort_keys=True, indent=4, default=str) )
+    while process_handles:
+        curr_join_handle = process_handles.pop()
+        curr_join_handle.join()
+    #print("\tAll copy processes have finished and rejoined with parent")
 
-                    latitude_string = str( abs(geotag_data['latitude_wgs84_degrees']) )
-
-                    # Spec for how GPS Coordinates should be formatted in EXIF portion of XMP:
-                    #   https://www.cipa.jp/std/documents/e/DC-X010-2017.pdf
-                    #
-                    # A.2.4.4 GPSCoodinate
-                    #
-                    # Value type of GPSCoodinate is a Text value in the form “DDD,MM,SSk” or “DDD,MM.mmk”, where:
-                    #
-                    # • DDD is a number of degrees
-                    # • MM is a number of minutes
-                    # • SS is a number of seconds
-                    # • mm is a fraction of minutes
-                    # • k is a single character N, S, E, or W indicating a direction (north, south, east, west)
-                    #
-                    # Leading zeros are not necessary for the for DDD, MM, and SS values. The DDD,MM.mmk form should be used
-                    # when any of the native Exif component rational values has a denominator other than 1. There can be any
-                    # number of fractional digits.
-
-                    latitude_degrees_string = str(abs(int(geotag_data['latitude_wgs84_degrees'])))
-                    latitude_fractional_degrees = abs(geotag_data['latitude_wgs84_degrees']) % 1
-                    latitude_fractional_minutes_string = f"{latitude_fractional_degrees * 60.0:.06f}"
-
-                    if geotag_data['latitude_wgs84_degrees'] >= 0:
-                        latitude_hemisphere = "N"
-                    else:
-                        latitude_hemisphere = "S"
-
-                    latitude_string = f"{latitude_degrees_string},{latitude_fractional_minutes_string}{latitude_hemisphere}"
-
-                    longitude_degrees_string = str(abs(int(geotag_data['longitude_wgs84_degrees'])))
-                    longitude_fractional_degrees = abs(geotag_data['longitude_wgs84_degrees']) % 1
-                    longitude_fractional_minutes_string = f"{longitude_fractional_degrees * 60.0:.06f}"
-
-                    if geotag_data['longitude_wgs84_degrees'] >= 0:
-                        longitude_hemisphere = "E"
-                    else:
-                        longitude_hemisphere = "W"
-
-                    longitude_string = f"{longitude_degrees_string},{longitude_fractional_minutes_string}{longitude_hemisphere}"
-
-                    string_replace_contents = \
-                        f"  <exif:GPSAltitude>{int(geotag_data['elevation_above_sea_level']['meters'] * 100)}/100</exif:GPSAltitude>\n" \
-                         "  <exif:GPSAltitudeRef>0</exif:GPSAltitudeRef>\n" \
-                        f"  <exif:GPSLatitude>{latitude_string}</exif:GPSLatitude>\n" \
-                        f"  <exif:GPSLongitude>{longitude_string}</exif:GPSLongitude>\n"
-
-                    # should_look_like = \
-                    #      "  <exif:GPSAltitude>128147/100</exif:GPSAltitude>\n" \
-                    #      "  <exif:GPSAltitudeRef>0</exif:GPSAltitudeRef>\n" \
-                    #      "  <exif:GPSLatitude>41,3.772866N</exif:GPSLatitude>\n" \
-                    #      "  <exif:GPSLongitude>112,14.433294W</exif:GPSLongitude>\n"
-
-                    # Read in the XMP file
-
-                    xmp_file_path = os.path.join( program_options['laptop_destination_folder'],
-                                                  curr_image_data['destination_xmp_file'] )
-
-                    #print( f"\tXMP file: {xmp_file_path}")
-
-                    with open( xmp_file_path, "r+") as xmp_handle:
-                        xmp_contents = xmp_handle.read()
-
-                        # Do replace
-                        xmp_contents_with_geotag = xmp_contents.replace(
-                            "  <exif:GPSAltitudeRef>0</exif:GPSAltitudeRef>\n",
-                            string_replace_contents )
-
-                        #print( f"XMP contents:\n{xmp_contents}")
-
-                        # Seek back to start of the file
-                        xmp_handle.seek(0)
-
-                        # Write our new contents
-                        xmp_handle.write( xmp_contents_with_geotag )
-
-                        # Truncate the file
-                        xmp_handle.truncate()
+    print( "\tAll copies to travel media complete")
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
 
-    print ("\tDone")
-
-    return {
-        "operation_time_seconds"    : operation_time_seconds,
-    }
-
+    return operation_time_seconds
 
 def _main():
     args = _parse_args()
@@ -1063,7 +926,6 @@ def _main():
     }
 
     program_options['file_extension'] = args.fileext.lower()
-    program_options['exiftool_path'] = args.exiftool
     program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
     program_options['gpx_file_folder'] = args.gpx_file_folder
     program_options['laptop_destination_folder'] = args.laptop_destination_folder
@@ -1093,10 +955,6 @@ def _main():
     timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
     perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
 
-    # Geocode all images now that we know their timestamps
-    geocode_images_results = _geocode_images( program_options, source_file_manifest )
-    perf_timer.add_perf_timing( 'Geocoding images', geocode_images_results['operation_time_seconds'])
-
     # Enumerate files already in the destination directory
     destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
     perf_timer.add_perf_timing( "Listing existing files in destination folder",
@@ -1123,27 +981,21 @@ def _main():
         verify_operation_results['operation_time_seconds'])
 
     # Create XMP sidecar files
-    print("\nCreating XMP sidecar files for all RAW images")
+    print("\nCreating geotagged XMP sidecar files for all RAW images")
     xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
     print( "\tDone")
     perf_timer.add_perf_timing(  'XMP File Generation', xmp_generation_results['operation_time_seconds'])
-
-    # Update XMP sidecar files with geotags
-    add_geotags_to_xmp_results = _add_geotags_to_xmp( destination_file_manifests, program_options )
-    perf_timer.add_perf_timing( 'Adding geotags to XMP files', add_geotags_to_xmp_results['operation_time_seconds'] )
 
     # Pull geotags out of XMP and store in manifest
 
     # Write manifest files to each date dir in scratch
 
-    # TODO:
-    #
-    #   - Change sourcedir to be sourcedir_full (e.g., 512GB CFexpress type B) and sourcedir_partial (256 SD cards)
-    #   - Add results of all partials into one hash. When done, compare to the full.
-    #   - Parallelize reading source imagery (reading two 256 GB partial SD cards and 512 GB CFexpress can fit in 40 gigabits with no contention)
-    #   - Add optional SD card destinations to arguments
-    #   - One thread per SD output
-    #       - Do all writes and then read back from external to make sure it worked
+    # Copy from laptop to external storage
+    # external_copies_time_seconds = _copy_files_to_external_storage( program_options, source_file_manifest )
+    # perf_timer.add_perf_timing( 'Copying all files from laptop to all travel storage media devices',
+    #                             external_copies_time_seconds )
+
+    # TODO: need to read back from external storage and run checksums to make sure all writes to external media worked
 
     # ZIP up the entire day in scratch storage (no compression!)
     # zipfile_path = os.path.join( "e:\\", "test.zip" )
