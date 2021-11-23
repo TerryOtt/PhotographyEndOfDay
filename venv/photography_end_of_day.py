@@ -16,6 +16,7 @@ import performance_timer
 import random
 import shutil
 import xml.etree.ElementTree
+import copy
 
 
 def _parse_args():
@@ -918,6 +919,8 @@ def _copy_files_to_external_storage( program_options, source_file_manifest ):
     return operation_time_seconds
 
 
+
+
 def _update_manifest_with_geotags( program_options, destination_file_manifests ):
     start_time = time.perf_counter()
 
@@ -1013,10 +1016,13 @@ def _write_manifest_files( program_options, destination_file_manifests ):
             if os.path.isfile( target_manifest_path ):
                 with open( target_manifest_path, "r") as existing_manifest_handle:
                     existing_manifest = json.load( existing_manifest_handle )
-                curr_day_manifest.update( existing_manifest )
+                write_manifest = copy.deepcopy( curr_day_manifest )
+                write_manifest.update( existing_manifest )
+            else:
+                write_manifest = curr_day_manifest
 
             with open( target_manifest_path, "w" ) as new_or_updated_manifest_handle:
-                json.dump( curr_day_manifest, new_or_updated_manifest_handle, indent=4, sort_keys=True,
+                json.dump( write_manifest, new_or_updated_manifest_handle, indent=4, sort_keys=True,
                            default=str)
 
     end_time = time.perf_counter()
@@ -1025,6 +1031,129 @@ def _write_manifest_files( program_options, destination_file_manifests ):
     return {
         'operation_time_seconds': operation_time_seconds,
     }
+
+
+def _verify_travel_media_file_worker( worker_num, program_options, hash_verification_queue,
+                                      hash_checked_queue, parent_done_writing ):
+    queue_timeout = 0.1
+
+    while True:
+        try:
+            file_to_verify_entry = hash_verification_queue.get(timeout=queue_timeout)
+        except queue.Empty:
+            if parent_done_writing.is_set():
+                break
+            else:
+                continue
+
+        file_path = file_to_verify_entry['absolute_path']
+        with open( file_path, "rb") as file_handle:
+            file_bytes = file_handle.read()
+
+        #print( f"Child {worker_index} got file info:\n{json.dumps(curr_file_entry, indent=4, sort_keys=True)}")
+
+        computed_hashes = {
+            #"sha3_384"  :   hashlib.sha3_384(file_bytes).hexdigest(),
+            "sha3_512"  :   hashlib.sha3_512(file_bytes).hexdigest(),
+        }
+
+        #print( f"{curr_file_entry['absolute_path']}: {computed_hashes['sha3_512']}")
+
+        hash_checked_queue.put(
+            {
+                "absolute_path"     : file_path,
+                "hash_correct"      : computed_hashes == file_to_verify_entry['hashes'],
+            }
+        )
+
+        #print( f"\tWorker sent results for {file_path} back to parent")
+
+        # Release our reference to the file entry
+        file_to_verify_entry = None
+        file_bytes = None
+
+    # If we break out of the loop, we're exiting normally
+
+
+def _verify_travel_media_copies( program_options, destination_file_manifests ):
+    start_time = time.perf_counter()
+
+    # Queue that parent writes files needing validation to children
+    hash_verification_queue = multiprocessing.Queue()
+
+    # Queue that children use to write results of file verification scan back to parent
+    hash_checked_queue = multiprocessing.Queue()
+
+    parent_done_writing = multiprocessing.Event()
+
+    process_handles = []
+    #print( "Program options: " + json.dumps(program_options, indent=4, sort_keys=True) )
+    for i in range(multiprocessing.cpu_count()):
+
+        verify_process_handle = multiprocessing.Process(target=_verify_travel_media_file_worker,
+                                             args=(i+1, program_options,
+                                                   hash_verification_queue,
+                                                   hash_checked_queue, parent_done_writing))
+        verify_process_handle.start()
+
+        process_handles.append(verify_process_handle)
+
+    files_to_verify_list = []
+    count_verify_checks_remaining = 0
+
+    for curr_year_folder in sorted( destination_file_manifests ):
+        for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
+            for curr_manifest_filename in sorted( destination_file_manifests[ curr_year_folder ][curr_date_folder] ):
+
+                curr_manifest_entry = destination_file_manifests[curr_year_folder][curr_date_folder][curr_manifest_filename]
+
+                for curr_travel_media_folder in program_options['travel_storage_media_folders']:
+                    files_to_verify_list.append(
+                        {
+                            'absolute_path'     : os.path.join( curr_travel_media_folder,
+                                                           curr_year_folder,
+                                                           curr_date_folder,
+                                                           curr_manifest_filename ),
+
+                            'hashes'            : curr_manifest_entry['hashes'],
+                        }
+                    )
+                    count_verify_checks_remaining += 1
+
+    # Loop through files to send out, alternating with reading all results out of queue
+    while files_to_verify_list or count_verify_checks_remaining > 0:
+        # Find out how many entries to write to children
+        entries_to_send = min( len(files_to_verify_list), multiprocessing.cpu_count() )
+
+        for i in range( entries_to_send ):
+            curr_entry_to_send = files_to_verify_list.pop()
+            hash_verification_queue.put( curr_entry_to_send )
+            #print( f"Parent sent {curr_entry_to_send['absolute_path']} to verify queue")
+            if len(files_to_verify_list) == 0:
+                parent_done_writing.set()
+                #print( "Parent marked done on sending data")
+
+        while True:
+            try:
+                child_result = hash_checked_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            if child_result['hash_correct'] is False:
+                print( f"ERROR: hash check failed for {child_result['absolute_path']}")
+            count_verify_checks_remaining -= 1
+
+    while process_handles:
+        curr_rejoin_handle = process_handles.pop()
+        curr_rejoin_handle.join()
+
+    #print( "\tAll children have rejoined, checks complete")
+
+    end_time = time.perf_counter()
+    operation_time_seconds = end_time - start_time
+
+    return operation_time_seconds
+
 
 def _main():
     args = _parse_args()
@@ -1064,10 +1193,6 @@ def _main():
     del source_image_info['reverse_map']
     perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
     source_file_manifest = manifest_info['source_manifest']
-    # How many files in the source manifest - is this where we dropped files?  yes, it is
-    #print( f"\tNumber of files tracked in source file list: {len(source_image_info['source_file_list'])}" )
-    #print( f"\tNumber of files in source manifest: {len(list(source_file_manifest))}")
-    #print( f"\tNumber of files in source manifest: {len(list(source_file_manifest))}")
 
     # Get timestamp for all image files
     timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
@@ -1123,8 +1248,15 @@ def _main():
     perf_timer.add_perf_timing( 'Copying all files from laptop to all travel storage media devices',
                                  external_copies_time_seconds )
 
+    # Validate external storage copies
+    print( "\nVerifying all travel media copies")
+    travel_media_verify_time_seconds = _verify_travel_media_copies( program_options, destination_file_manifests )
+    print( "\tDone")
+    perf_timer.add_perf_timing( "Verifying all travel media copies match original hashes",
+                                travel_media_verify_time_seconds )
 
     # Final perf print
+    print( "" )
     perf_timer.display_performance()
 
 if __name__ == "__main__":
