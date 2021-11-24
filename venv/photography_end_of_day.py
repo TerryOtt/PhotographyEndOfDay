@@ -1120,6 +1120,19 @@ def _verify_travel_media_copies( program_options, destination_file_manifests ):
                     )
                     count_verify_checks_remaining += 1
 
+                    files_to_verify_list.append(
+                        {
+                            'absolute_path': os.path.join(curr_travel_media_folder,
+                                                          curr_manifest_entry['xmp']['filename'] ),
+
+                            'hashes': {
+                                'sha3_512': curr_manifest_entry['xmp']['sha3_512']
+                            },
+                        }
+                    )
+
+                    count_verify_checks_remaining += 1
+
     # Loop through files to send out, alternating with reading all results out of queue
     while files_to_verify_list or count_verify_checks_remaining > 0:
         # Find out how many entries to write to children
@@ -1258,6 +1271,7 @@ def _main():
     # Final perf print
     print( "" )
     perf_timer.display_performance()
+
 
 if __name__ == "__main__":
     _main()
