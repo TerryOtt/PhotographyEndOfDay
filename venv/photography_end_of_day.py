@@ -777,6 +777,7 @@ def _create_xmp_files( destination_file_manifests, program_options ):
 
     # Fire up the child processes
     for i in range(multiprocessing.cpu_count()):
+    #for i in range(1):
         process_handle = multiprocessing.Process( target=_xmp_creation_worker,
                                                   args=(i+1, xmp_file_queue, parent_done_writing, program_options ) )
         process_handle.start()
@@ -812,6 +813,54 @@ def _create_xmp_files( destination_file_manifests, program_options ):
     return {
         "operation_time_seconds"    : operation_time_seconds,
     }
+
+
+def _do_xmp_cleanup_canon_rf_24_105_lens_id( generated_xmp_file ):
+    # ExifTool creates the following section in the XMP for a Canon RF 24-105 f4-7.1 IS STM lens:
+    #
+    #  <rdf:Description rdf:about=''
+    #   xmlns:aux='http://ns.adobe.com/exif/1.0/aux/'>
+    #   <aux:Lens>24.0 - 105.0 mm</aux:Lens>
+    #  </rdf:Description>
+    #
+    # That is parsed very poorly by Lightroom, and it tags the Lens as "24," which doesn't look good in
+    #   Lightroom and would look even worse in Flickr
+    with open( generated_xmp_file, "r") as xmp_handle:
+        xmp_contents = xmp_handle.read()
+
+    # See if we have a Canon EOS R5 with that lens before making any changes
+    identifying_aux_section_string = " <rdf:Description rdf:about=''\n" + \
+        "  xmlns:aux='http://ns.adobe.com/exif/1.0/aux/'>\n" + \
+        "  <aux:Lens>24</aux:Lens>\n" + \
+        "  <aux:LensID>61182</aux:LensID>\n" + \
+        " </rdf:Description>"
+    identifying_strings = [
+        "<tiff:Model>Canon EOS R5</tiff:Model>",
+        identifying_aux_section_string,
+    ]
+
+    if all( curr_identifying_string in xmp_contents for curr_identifying_string in identifying_strings ):
+        #print( f"File {generated_xmp_file} is from a Canon EOS R5 with RF 24-105mm f/4-7.1 IS STM lens")
+
+        replaced_aux_section_string = """ <rdf:Description rdf:about=''
+  xmlns:aux='http://ns.adobe.com/exif/1.0/aux/'>
+  <aux:Lens>RF24-105mm F4-7.1 IS STM</aux:Lens>
+  <aux:LensInfo>24/1 105/1 0/0 0/0</aux:LensInfo>
+  <aux:LensID>61182</aux:LensID>
+ </rdf:Description>"""
+
+        # Open the XMP up and replace the aux section entirely
+        with open( generated_xmp_file, "w") as fixed_handle:
+            fixed_handle.write( xmp_contents.replace(identifying_aux_section_string, replaced_aux_section_string))
+
+    else:
+        #print(f"File {generated_xmp_file} is NOT from a Canon EOS R5 with RF 24-105mm f/4-7.1 IS STM lens")
+        #print( "XMP Contents:\n" + xmp_contents)
+        pass
+
+
+def _cleanup_xmp( generated_xmp_file ):
+    _do_xmp_cleanup_canon_rf_24_105_lens_id( generated_xmp_file )
 
 
 def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_done_writing, program_options ):
@@ -852,9 +901,11 @@ def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_
             execute_output = exiftool_handle.execute( *exiftool_parameters )
             #print("Back from EXIFTool")
 
-            #print( "Exiftool execute results:\n" + execute_output.decode() )
+            # Do any necessary cleanup to the newly-generated XMP file to make for cleaner import
+            #   into Lightroom (e.g., fixing a lens identifier for Canon RF 24-105mm f/4-7.1 IS STM)
+            _cleanup_xmp( expected_xmp_file )
 
-            # Now adding geotags to the XMP file -- note we're making the first stage XMP our source,
+            # Now adding geotags to the XMP file -- note we're making the first-stage XMP our source,
             #   not the RAW image -- we don't want to write tags to the RAW file, just the XMP
             exiftool_params = (
                 #"-v2".encode(),
