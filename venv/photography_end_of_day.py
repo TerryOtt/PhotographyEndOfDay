@@ -20,7 +20,7 @@ import copy
 
 
 #num_worker_processes = multiprocessing.cpu_count() - 2
-max_processes_running = 13
+max_processes_running = 15
 curr_processes_running = 1
 
 def _parse_args():
@@ -142,8 +142,6 @@ def _enumerate_source_images(program_options):
             process_handles.append(curr_handle)
             directories_scanned += 1
 
-    print( f"During enumeration, have {curr_processes_running} / {max_processes_running} processes running")
-
     # Children cannot terminate with a queue that's full, so drain the results queue
     for curr_index in range( directories_scanned ):
         scan_results = directory_scan_results_queue.get()
@@ -174,8 +172,6 @@ def _enumerate_source_images(program_options):
         #print( "Child process rejoined" )
 
     #print( "\tAll workers have rejoined cleanly" )
-
-    print(f"After joins in enumeration, have {curr_processes_running} / {max_processes_running} processes running")
 
     # We've populated the full list, and the partial list (if we got partial dirs). Need to make sure
     #   the partial list matches the full list (only worry about relative filenames -- we'll check contents later when we're
@@ -242,8 +238,6 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
         #print(f"Parent back from start on hash worker {i+1}")
         hash_worker_handles.append( process_handle )
     #print( "All hash workers started" )
-
-    print(f"During source manifest, have {curr_processes_running} / {max_processes_running} processes running")
 
     source_manifest = {}
 
@@ -324,9 +318,6 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
         curr_handle.join()
         curr_processes_running -= 1
     #print("All hash workers rejoined")
-
-    print(f"During source manifest, have {curr_processes_running} / {max_processes_running} processes running after joins")
-
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
