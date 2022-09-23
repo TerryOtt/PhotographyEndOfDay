@@ -19,6 +19,8 @@ import xml.etree.ElementTree
 import copy
 
 
+num_worker_processes = multiprocessing.cpu_count() - 2
+
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="End of day script to validate data, geotag, copy to SSD")
     arg_parser.add_argument("--debug", help="Lower logging level from INFO to DEBUG", action="store_true" )
@@ -38,7 +40,7 @@ def _parse_args():
     arg_parser.add_argument("file_timestamp_utc_offset_hours",
                             help="Hours offset from UTC, e.g. EDT is -4, Afghanistan is +4.5",
                             type=float)
-    arg_parser.add_argument( "gpx_file_folder", help="Path to folder with all GPX files for these pictures")
+    #gpx_file_folder", help="Path to folder with all GPX files for these pictures")
     arg_parser.add_argument( "laptop_destination_folder", help="Path to storage folder on laptop NVMe" )
     arg_parser.add_argument( "travel_storage_media_folder", nargs="+",
                              help="External travel storage media folder " + \
@@ -214,7 +216,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
 
     # Launch hash workers
     hash_worker_handles = []
-    for i in range( multiprocessing.cpu_count() ):
+    for i in range( num_worker_processes ):
         process_handle = multiprocessing.Process( target=_hash_worker,
                                                   args=(i+1, files_to_hash_queue,
                                                         completed_files_queue,
@@ -248,7 +250,7 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     #print( f"\tHashing {total_hash_count} files in order to confirm all copies of {total_file_count} manifest entries match")
     while hashes_received < total_hash_count:
         # Populate the filename hash list
-        filenames_to_send = min( filenames_left_to_send, multiprocessing.cpu_count() )
+        filenames_to_send = min( filenames_left_to_send, num_worker_processes )
         for i in range( filenames_to_send ):
             curr_absolute_path = shuffled_absolute_path_list.pop()
             files_to_hash_queue.put(
@@ -372,7 +374,7 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
     # Queue that children use to write EXIF timestamp information data back to parent
     processed_file_queue = multiprocessing.Queue(maxsize=file_count)
 
-    for i in range(multiprocessing.cpu_count()):
+    for i in range(num_worker_processes):
         process_handle = multiprocessing.Process( target=_exif_timestamp_worker,
                                                   args=(i+1, files_to_process_queue,
                                                         processed_file_queue,
@@ -601,13 +603,13 @@ def _set_unique_destination_filename( source_file, file_data, program_options, e
                                                                 date_components['date_iso8601'],
                                                                 test_filename )
 
-    # Record the XMP filename for this destination file
-    (filename_no_extension, filename_extension) = os.path.splitext( test_filename )
-    file_data[ 'xmp' ] = {
-        'filename': os.path.join( date_components['year'],
-                                  date_components['date_iso8601'],
-                                  f"{filename_no_extension}.xmp" ),
-    }
+    # # Record the XMP filename for this destination file
+    # (filename_no_extension, filename_extension) = os.path.splitext( test_filename )
+    # file_data[ 'xmp' ] = {
+    #     'filename': os.path.join( date_components['year'],
+    #                               date_components['date_iso8601'],
+    #                               f"{filename_no_extension}.xmp" ),
+    # }
 
     # Update destination manifest
     manifest_for_this_file[ test_filename ] = file_data
@@ -677,7 +679,7 @@ def _do_file_copies_to_laptop( program_options, source_file_manifest ):
             #print( f"\tCopied \"{source_absolute_path}\" -> \"{dest_path}\" successfully")
 
         except:
-            print(f"Exception thrown when copying {curr_file_entry['file_path']}")
+            print(f"Exception thrown when copying {curr_file_entry['unique_destionation_file_path']}")
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -700,7 +702,7 @@ def _do_readback_validation( source_file_manifest, program_options ):
     # Event object that parent uses so children know when to stop reading
     parent_done_writing = multiprocessing.Event()
 
-    for i in range(multiprocessing.cpu_count()):
+    for i in range(num_worker_processes):
         process_handle = multiprocessing.Process( target=_validation_worker,
                                                   args=(i+1, files_to_verify_queue, parent_done_writing) )
         process_handle.start()
@@ -776,7 +778,7 @@ def _create_xmp_files( destination_file_manifests, program_options ):
     process_handles = []
 
     # Fire up the child processes
-    for i in range(multiprocessing.cpu_count()):
+    for i in range(num_worker_processes):
     #for i in range(1):
         process_handle = multiprocessing.Process( target=_xmp_creation_worker,
                                                   args=(i+1, xmp_file_queue, parent_done_writing, program_options ) )
@@ -1139,7 +1141,7 @@ def _verify_travel_media_copies( program_options, destination_file_manifests ):
 
     process_handles = []
     #print( "Program options: " + json.dumps(program_options, indent=4, sort_keys=True) )
-    for i in range(multiprocessing.cpu_count()):
+    for i in range(num_worker_processes):
 
         verify_process_handle = multiprocessing.Process(target=_verify_travel_media_file_worker,
                                              args=(i+1, program_options,
@@ -1171,23 +1173,24 @@ def _verify_travel_media_copies( program_options, destination_file_manifests ):
                     )
                     count_verify_checks_remaining += 1
 
-                    files_to_verify_list.append(
-                        {
-                            'absolute_path': os.path.join(curr_travel_media_folder,
-                                                          curr_manifest_entry['xmp']['filename'] ),
-
-                            'hashes': {
-                                'sha3_512': curr_manifest_entry['xmp']['sha3_512']
-                            },
-                        }
-                    )
-
-                    count_verify_checks_remaining += 1
+                    # Not creating XMP files, so don't worry about them
+                    # files_to_verify_list.append(
+                    #     {
+                    #         'absolute_path': os.path.join(curr_travel_media_folder,
+                    #                                       curr_manifest_entry['xmp']['filename'] ),
+                    #
+                    #         'hashes': {
+                    #             'sha3_512': curr_manifest_entry['xmp']['sha3_512']
+                    #         },
+                    #     }
+                    # )
+                    #
+                    # count_verify_checks_remaining += 1
 
     # Loop through files to send out, alternating with reading all results out of queue
     while files_to_verify_list or count_verify_checks_remaining > 0:
         # Find out how many entries to write to children
-        entries_to_send = min( len(files_to_verify_list), multiprocessing.cpu_count() )
+        entries_to_send = min( len(files_to_verify_list), num_worker_processes )
 
         for i in range( entries_to_send ):
             curr_entry_to_send = files_to_verify_list.pop()
@@ -1237,7 +1240,7 @@ def _main():
 
     program_options['file_extension'] = args.fileext.lower()
     program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
-    program_options['gpx_file_folder'] = args.gpx_file_folder
+#    program_options['gpx_file_folder'] = args.gpx_file_folder
     program_options['laptop_destination_folder'] = args.laptop_destination_folder
     program_options['travel_storage_media_folders'] = args.travel_storage_media_folder
 
@@ -1288,17 +1291,17 @@ def _main():
         verify_operation_results['operation_time_seconds'])
 
     # Create XMP sidecar files
-    print("\nCreating geotagged XMP sidecar files for all RAW images")
-    xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
-    print( "\tDone")
-    perf_timer.add_perf_timing(  'Generating geotagged XMP files', xmp_generation_results['operation_time_seconds'])
+#    print("\nCreating geotagged XMP sidecar files for all RAW images")
+#    xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
+#    print( "\tDone")
+#    perf_timer.add_perf_timing(  'Generating geotagged XMP files', xmp_generation_results['operation_time_seconds'])
 
     # Pull geotags out of XMP and store in manifest
-    print( "\nUpdating manifest with geotag and XMP hash data")
-    geotag_and_timestamp_manifest_update_results = _update_manifest_with_geotags( program_options,
-                                                                                  destination_file_manifests )
-    print( "\tDone" )
-    perf_timer.add_perf_timing( "Adding geotags and XMP file hashes to manifest", geotag_and_timestamp_manifest_update_results['operation_time_seconds'])
+#    print( "\nUpdating manifest with geotag and XMP hash data")
+#    geotag_and_timestamp_manifest_update_results = _update_manifest_with_geotags( program_options,
+#                                                                                  destination_file_manifests )
+#    print( "\tDone" )
+#    perf_timer.add_perf_timing( "Adding geotags and XMP file hashes to manifest", geotag_and_timestamp_manifest_update_results['operation_time_seconds'])
 
     # Create (or update) daily manifest files
     print( "\nWriting or updating per-day manifest files" )
