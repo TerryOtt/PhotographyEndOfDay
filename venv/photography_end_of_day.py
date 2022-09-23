@@ -19,7 +19,9 @@ import xml.etree.ElementTree
 import copy
 
 
-num_worker_processes = multiprocessing.cpu_count() - 2
+#num_worker_processes = multiprocessing.cpu_count() - 2
+max_processes_running = 13
+curr_processes_running = 1
 
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="End of day script to validate data, geotag, copy to SSD")
@@ -94,6 +96,8 @@ def _enumerate_source_images(program_options):
 
     print( "\nEnumerating source images")
 
+    global curr_processes_running
+
     source_file_lists = {
         'full': {},
         'partial': None,
@@ -113,6 +117,7 @@ def _enumerate_source_images(program_options):
                                                    directory_scan_results_queue))
 
     curr_handle.start()
+    curr_processes_running += 1
     print(f"\tScanning \"{program_options['sourcedirs']['full']}\" for RAW image files with extension " +
           f"\".{program_options['file_extension']}\" (full contents)")
 
@@ -130,11 +135,14 @@ def _enumerate_source_images(program_options):
                                                            which_source_list,
                                                            directory_scan_results_queue))
             curr_handle.start()
+            curr_processes_running += 1
             print(f"\tScanning \"{curr_partial_dir}\" for RAW image files with extension " +
                   f".\"{program_options['file_extension']}\" (partial contents)")
 
             process_handles.append(curr_handle)
             directories_scanned += 1
+
+    print( f"During enumeration, have {curr_processes_running} / {max_processes_running} processes running")
 
     # Children cannot terminate with a queue that's full, so drain the results queue
     for curr_index in range( directories_scanned ):
@@ -162,10 +170,12 @@ def _enumerate_source_images(program_options):
         rejoin_handle = process_handles.pop()
         #print( f"Waiting for {pprint.pformat(rejoin_handle)} to rejoin")
         rejoin_handle.join()
+        curr_processes_running -= 1
         #print( "Child process rejoined" )
 
     #print( "\tAll workers have rejoined cleanly" )
 
+    print(f"After joins in enumeration, have {curr_processes_running} / {max_processes_running} processes running")
 
     # We've populated the full list, and the partial list (if we got partial dirs). Need to make sure
     #   the partial list matches the full list (only worry about relative filenames -- we'll check contents later when we're
@@ -205,6 +215,8 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
 
     print( "\nGenerating source manifest")
 
+    global curr_processes_running
+
     # Queue with filenames that hash workers will read and hash
     files_to_hash_queue = multiprocessing.Queue()
 
@@ -216,6 +228,9 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
 
     # Launch hash workers
     hash_worker_handles = []
+
+    num_worker_processes = max_processes_running - curr_processes_running
+
     for i in range( num_worker_processes ):
         process_handle = multiprocessing.Process( target=_hash_worker,
                                                   args=(i+1, files_to_hash_queue,
@@ -223,9 +238,12 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
                                                         all_hashes_read) )
 
         process_handle.start()
+        curr_processes_running += 1
         #print(f"Parent back from start on hash worker {i+1}")
         hash_worker_handles.append( process_handle )
     #print( "All hash workers started" )
+
+    print(f"During source manifest, have {curr_processes_running} / {max_processes_running} processes running")
 
     source_manifest = {}
 
@@ -304,7 +322,11 @@ def _generate_source_manifest( reverse_file_map, source_file_list ):
     while hash_worker_handles:
         curr_handle = hash_worker_handles.pop()
         curr_handle.join()
+        curr_processes_running -= 1
     #print("All hash workers rejoined")
+
+    print(f"During source manifest, have {curr_processes_running} / {max_processes_running} processes running after joins")
+
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -363,6 +385,7 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
     file_count = len(source_image_files)
 
     print( f"\nExtracting EXIF timestamps from source images")
+    global curr_processes_running
 
     start_time = time.perf_counter()
 
@@ -374,6 +397,8 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
     # Queue that children use to write EXIF timestamp information data back to parent
     processed_file_queue = multiprocessing.Queue(maxsize=file_count)
 
+    num_worker_processes = max_processes_running - curr_processes_running
+
     for i in range(num_worker_processes):
         process_handle = multiprocessing.Process( target=_exif_timestamp_worker,
                                                   args=(i+1, files_to_process_queue,
@@ -381,6 +406,7 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
                                                         program_options) )
 
         process_handle.start()
+        curr_processes_running += 1
         logging.debug(f"Parent back from start on timestamp child process {i+1}")
         process_handles.append( process_handle )
 
@@ -410,6 +436,7 @@ def _extract_image_timestamps( program_options, source_image_manifest ):
         curr_handle = process_handles.pop()
         #logging.debug("parent process waiting for child worker to rejoin")
         curr_handle.join()
+        curr_processes_running -= 1
         #logging.debug("child process has rejoined cleanly")
 
     #logging.debug("Parent process exiting, all EXIF timestamp work done")
@@ -694,6 +721,8 @@ def _do_file_copies_to_laptop( program_options, source_file_manifest ):
 def _do_readback_validation( source_file_manifest, program_options ):
     start_time = time.perf_counter()
 
+    global curr_processes_running
+
     process_handles = []
 
     #  Queue for sending files needing validation  to children
@@ -702,10 +731,13 @@ def _do_readback_validation( source_file_manifest, program_options ):
     # Event object that parent uses so children know when to stop reading
     parent_done_writing = multiprocessing.Event()
 
+    num_worker_processes = max_processes_running - curr_processes_running
+
     for i in range(num_worker_processes):
         process_handle = multiprocessing.Process( target=_validation_worker,
                                                   args=(i+1, files_to_verify_queue, parent_done_writing) )
         process_handle.start()
+        curr_processes_running += 1
         #logging.debug(f"Parent back from start on child process {i+1}")
         process_handles.append( process_handle )
 
@@ -727,6 +759,7 @@ def _do_readback_validation( source_file_manifest, program_options ):
     while process_handles:
         curr_process = process_handles.pop()
         curr_process.join()
+        curr_processes_running -= 1
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -766,6 +799,8 @@ def _validation_worker( worker_index, files_to_verify_queue, parent_done_writing
 def _create_xmp_files( destination_file_manifests, program_options ):
     start_time = time.perf_counter()
 
+    global curr_processes_running
+
     #  Queue for sending files needing XMP files children
     xmp_file_queue = multiprocessing.Queue()
 
@@ -777,12 +812,15 @@ def _create_xmp_files( destination_file_manifests, program_options ):
 
     process_handles = []
 
+    num_worker_processes = max_processes_running - curr_processes_running
+
     # Fire up the child processes
     for i in range(num_worker_processes):
     #for i in range(1):
         process_handle = multiprocessing.Process( target=_xmp_creation_worker,
                                                   args=(i+1, xmp_file_queue, parent_done_writing, program_options ) )
         process_handle.start()
+        curr_processes_running += 1
         #logging.debug(f"Parent back from start on child process {i+1}")
         process_handles.append( process_handle )
 
@@ -808,6 +846,7 @@ def _create_xmp_files( destination_file_manifests, program_options ):
     while process_handles:
         curr_handle = process_handles.pop()
         curr_handle.join()
+        curr_processes_running -= 1
 
     end_time = time.perf_counter()
     operation_time_seconds = end_time - start_time
@@ -945,6 +984,8 @@ def _copy_to_external_storage_worker( program_options, curr_travel_storage_media
 def _copy_files_to_external_storage( program_options, source_file_manifest ):
     print( "\nCopying staged files from laptop NVMe to external storage travel media")
 
+    global curr_processes_running
+
     start_time = time.perf_counter()
     process_handles = []
     #print( "Program options: " + json.dumps(program_options, indent=4, sort_keys=True) )
@@ -955,6 +996,7 @@ def _copy_files_to_external_storage( program_options, source_file_manifest ):
                                                    curr_travel_storage_media_folder,
                                                    source_file_manifest))
         copy_process_handle.start()
+        curr_processes_running += 1
         #print(f"\tStarted copy of staged files to external travel storage media folder \"{curr_travel_storage_media_folder}\" ")
 
         process_handles.append(copy_process_handle)
@@ -962,6 +1004,7 @@ def _copy_files_to_external_storage( program_options, source_file_manifest ):
     while process_handles:
         curr_join_handle = process_handles.pop()
         curr_join_handle.join()
+        curr_processes_running -= 1
     #print("\tAll copy processes have finished and rejoined with parent")
 
     print( "\tAll copies to travel media complete")
@@ -1131,6 +1174,8 @@ def _verify_travel_media_file_worker( worker_num, program_options, hash_verifica
 def _verify_travel_media_copies( program_options, destination_file_manifests ):
     start_time = time.perf_counter()
 
+    global curr_processes_running
+
     # Queue that parent writes files needing validation to children
     hash_verification_queue = multiprocessing.Queue()
 
@@ -1140,6 +1185,9 @@ def _verify_travel_media_copies( program_options, destination_file_manifests ):
     parent_done_writing = multiprocessing.Event()
 
     process_handles = []
+
+    num_worker_processes = max_processes_running - curr_processes_running
+
     #print( "Program options: " + json.dumps(program_options, indent=4, sort_keys=True) )
     for i in range(num_worker_processes):
 
@@ -1148,6 +1196,7 @@ def _verify_travel_media_copies( program_options, destination_file_manifests ):
                                                    hash_verification_queue,
                                                    hash_checked_queue, parent_done_writing))
         verify_process_handle.start()
+        curr_processes_running += 1
 
         process_handles.append(verify_process_handle)
 
@@ -1213,6 +1262,7 @@ def _verify_travel_media_copies( program_options, destination_file_manifests ):
     while process_handles:
         curr_rejoin_handle = process_handles.pop()
         curr_rejoin_handle.join()
+        curr_processes_running -= 1
 
     #print( "\tAll children have rejoined, checks complete")
 
