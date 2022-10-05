@@ -2,6 +2,10 @@ import argparse
 import multiprocessing
 import logging
 import json
+import os
+import sys
+import exiftool
+import datetime
 
 # import pprint
 # import json
@@ -53,13 +57,118 @@ def _parse_args():
                             default=max_processes_default,
                             type=int )
 
-    arg_parser.add_argument("raw_file_fileext", help="File extension, e.g. \"NEF\", \"CR3\"")
+    known_raw_file_extensions = ['NEF', 'CR3']
+    arg_parser.add_argument("raw_file_fileext",
+                            type=str.upper,
+                            choices=known_raw_file_extensions,
+                            help=f"File extension for RAW files" )
 
     arg_parser.add_argument("travel_storage_media_folder", nargs="+",
                             help="Travel storage folder " + \
                                  "(e.g., laptop NVMe drive, SanDisk Extreme Pro 4TB, WD My Passport 4TB)")
 
     return arg_parser.parse_args()
+
+
+def _scan_source_dir_for_images( curr_source_dir, program_options ):
+    image_files = []
+    cumulative_bytes = 0
+    print(f"\tStarting file walk of {curr_source_dir}")
+
+    for subdir, dirs, files in os.walk(curr_source_dir):
+        for filename in files:
+            if filename.lower().endswith(program_options['file_extension']):
+                file_absolute_path = os.path.join(curr_source_dir, subdir, filename)
+                #print( "\tFound image with full path: \"{0}\"".format(file_absolute_path))
+                file_size_bytes = os.path.getsize(file_absolute_path)
+                # logging.debug(f"File size of {file_absolute_path}: {file_size_bytes}")
+                cumulative_bytes += file_size_bytes
+                image_files.append(
+                    {
+                        'file_path': {
+                            'absolute': file_absolute_path,
+                            'relative': os.path.relpath(file_absolute_path, curr_source_dir)
+                        },
+                        'filesize_bytes': file_size_bytes,
+                    }
+                )
+                # break
+            else:
+                # logging.debug( "Skipping non-image file {0}".format(filename))
+                pass
+
+    # Walk complete, send results to parent
+    return image_files
+
+def _enumerate_source_images(program_options):
+    print( "\nEnumerating source images")
+
+    source_file_lists = {}
+
+    exiftool_tag_name = "EXIF:DateTimeOriginal"
+
+    # Create a dictionary that maps all absolute file paths to the relative one they have in common
+    for curr_sourcedir in program_options['sourcedirs']:
+        source_file_lists[curr_sourcedir] = _scan_source_dir_for_images(curr_sourcedir, program_options )
+
+    # Populate EXIF timestamps for all images
+    raw_file_list = []
+    reverse_map = {}
+    for curr_sourcedir in source_file_lists:
+        for (index, curr_file_entry) in enumerate(source_file_lists[curr_sourcedir]):
+            raw_file_list.append(curr_file_entry['file_path']['absolute'])
+
+            # Store a reference into the source array keyed by absolute filename so we can do a quick update with the timestamp
+            reverse_map[ curr_file_entry['file_path']['absolute'] ] = source_file_lists[curr_sourcedir][index]
+
+    print( f"Reverse map created:\n{json.dumps(reverse_map, indent=4, sort_keys=True)}")
+
+    raw_file_list.sort()
+
+    with exiftool.ExifToolHelper() as exiftool_handle:
+        exiftool_tag_name = "EXIF:DateTimeOriginal"
+        file_timestamps = exiftool_handle.get_tags( raw_file_list, tags = [ exiftool_tag_name] )
+
+    print( f"Timestamp results:\n{json.dumps(file_timestamps, indent=4, sort_keys=True)}")
+
+    for curr_timestamp_entry in file_timestamps:
+        file_datetime_no_tz = datetime.datetime.strptime(curr_timestamp_entry[exiftool_tag_name], "%Y:%m:%d %H:%M:%S")
+        # Do hour shift from timezone-unaware EXIF datetime to UTC (still no TZ, just shifting hours)
+        shifted_datetime_no_tz = file_datetime_no_tz + datetime.timedelta(
+            hours=-(program_options['timestamp_utc_offset_hours']))
+        # Create TZ-aware datetime, as one should basically always strive to use
+        file_datetime_utc = shifted_datetime_no_tz.replace(tzinfo=datetime.timezone.utc)
+
+        # Convert the SourceFile tag to be windows-friendly (backslashes)
+        reverse_map_key = curr_timestamp_entry['SourceFile'].replace( '/', os.sep)
+        reverse_map[ reverse_map_key ]['timestamp'] = file_datetime_utc
+
+    # Make sure all file lists came out identical
+    for curr_sourcedir in program_options['sourcedirs'][2:]:
+        if source_file_lists[program_options['sourcedirs'][0]] != source_file_lists[curr_sourcedir]:
+            logging.error( "Contents of source dirs do not match, bailing")
+            sys.exit( 1 )
+
+    print( "\tContents of all sourcedirs match!")
+
+    total_file_count = len( source_file_lists[program_options['sourcedirs'][0]] )
+
+    print ( f"\tFound {total_file_count} .{program_options['file_extension']} files")
+
+    # Create return list (only need relative paths)
+    file_dict = {}
+    for curr_file_entry in source_file_lists[program_options['sourcedirs'][0]]:
+        file_dict[ curr_file_entry['file_path']['relative']] = {
+            'filesize_bytes'    : curr_file_entry['filesize_bytes'],
+            'timestamp'         : curr_file_entry['timestamp']
+        }
+
+    return {
+        # Only need to return one source file list, as they're all identical
+        'source_file_dict' : file_dict,
+        'total_file_count'  : total_file_count
+    }
+
 
 def _main():
     args = _parse_args()
@@ -85,14 +194,10 @@ def _main():
     program_options['destination_folders'] = args.travel_storage_media_folder
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
-#
-#     perf_timer = performance_timer.PerformanceTimer()
-#
-#     source_image_info = _enumerate_source_images(program_options)
-#     perf_timer.add_perf_timing( 'Enumerating source images', source_image_info['operation_time_seconds'])
-#
-#     #print( "File list to create source manifest:\n" + json.dumps(source_image_info['file_list'], indent=4, sort_keys=True) )
-#     #print( "Reverse map for hashing:\n" + json.dumps(source_image_info['reverse_map'], indent=4) )
+
+    source_image_info = _enumerate_source_images(program_options)
+    print( "\nSource file info:\n" + json.dumps(source_image_info['source_file_dict'],
+                                                                 indent=4, sort_keys=True, default=str) )
 #
 #     manifest_info = _generate_source_manifest( source_image_info['reverse_map'],
 #                                                source_image_info['source_file_list'] )
