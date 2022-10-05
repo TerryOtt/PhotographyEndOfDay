@@ -82,6 +82,7 @@ def _enumerate_source_images(program_options):
     print( "\nEnumerating source images")
 
     source_file_lists = {}
+    total_file_bytes = 0
 
     exiftool_tag_name = "EXIF:DateTimeOriginal"
 
@@ -131,7 +132,8 @@ def _enumerate_source_images(program_options):
 
     total_file_count = len( source_file_lists[program_options['sourcedirs'][0]] )
 
-    print ( f"\tFound {total_file_count} .{program_options['file_extension']} files")
+    #total_file_count = 9876
+
 
     # Create return list (only need relative paths)
     file_dict = {}
@@ -140,11 +142,19 @@ def _enumerate_source_images(program_options):
             'filesize_bytes'    : curr_file_entry['filesize_bytes'],
             'timestamp'         : curr_file_entry['timestamp']
         }
+        total_file_bytes += curr_file_entry['filesize_bytes']
+
+    bytes_in_gb = 1073741824.0
+    total_file_gb = total_file_bytes / bytes_in_gb
+
+    print ( f"\tFound {total_file_count:,} \".{program_options['file_extension']}\" files totalling " +
+            f"{total_file_gb:.02f} GB")
 
     return {
         # Only need to return one source file list, as they're all identical
-        'source_file_dict' : file_dict,
-        'total_file_count'  : total_file_count
+        'source_file_dict'  : file_dict,
+        'total_file_count'  : total_file_count,
+        'total_file_bytes'  : total_file_bytes
     }
 
 
@@ -184,11 +194,10 @@ def _set_destination_filenames( program_options, source_image_info ):
 
     #print( f"Updated source file info:\n{json.dumps(source_image_info, indent=4, sort_keys=True, default=str)}")
 
-#    num_files = len(source_image_info)
-    num_files = 4567
-    #no_conflict_count = num_files - filename_conflicts_found
-    print( f"\t{num_files:6,} file(s) have had their unique destination paths determined")
-    print( f"\t{filename_conflicts_found:6,} file(s) had to have their destination paths updated due to existing files in the destination dir")
+    num_files = len(source_image_info)
+    #num_files = 4567
+    print( f"\t{num_files:6,} \".{program_options['file_extension']}\" file(s) have had their unique destination paths determined")
+    print( f"\t{filename_conflicts_found:6,} \".{program_options['file_extension']}\" file(s) had to have their destination paths updated due to existing files in the destination dir")
 
 
 def _main():
