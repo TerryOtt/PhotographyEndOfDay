@@ -1,5 +1,7 @@
 import argparse
 import multiprocessing
+import logging
+import json
 
 # import pprint
 # import json
@@ -28,20 +30,21 @@ import multiprocessing
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="End of day script to create validated travel copies of all pics")
     arg_parser.add_argument("--debug", help="Lower logging level from INFO to DEBUG", action="store_true")
+    arg_parser.add_argument("--logfile",
+                            help="file to store logs to (default: stdout)" )
     arg_parser.add_argument("--singlethreaded", help="Disable multi-threading, do everything single threaded",
                             action="store_true")
 
     # The "Action append" lets the parameter be specified multiple times, but it's still optional so may exist no times
-    arg_parser.add_argument("--sourcedir_fast",
-                            help="Path to a source directory that's (relatively) fast transfer (e.g. CFexpress type B)",
-                            action='append')
-    arg_parser.add_argument("--sourcedir_slow",
-                            help="Path to a source directory that's (relatively) slow  transfer (e.g. SDXC)",
+    arg_parser.add_argument("--sourcedir",
+                            help="Path to a source directory with RAW files",
+                            required=True,
                             action='append')
 
     arg_parser.add_argument("--timestamp_utc_offset_hours",
                             help="Integer hours offset from UTC, e.g., EDT is -4, PDT is -7",
-                            type=int)
+                            type=int,
+                            default=0)
 
     max_processes_default = multiprocessing.cpu_count() - 1
     arg_parser.add_argument("--max_processes",
@@ -49,6 +52,8 @@ def _parse_args():
                                 f" (default on this computer: {max_processes_default})",
                             default=max_processes_default,
                             type=int )
+
+    arg_parser.add_argument("raw_file_fileext", help="File extension, e.g. \"NEF\", \"CR3\"")
 
     arg_parser.add_argument("travel_storage_media_folder", nargs="+",
                             help="Travel storage folder " + \
@@ -64,21 +69,22 @@ def _main():
         log_level = logging.INFO
     else:
         log_level = logging.DEBUG
-    logging.basicConfig( filename=args.logfile, level=log_level )
-    #logging.basicConfig(level=log_level)
 
-    program_options['sourcedirs'] = {
-        'full'      : args.sourcedir_full,
-        'partial'   : args.sourcedir_partial,
-    }
+    if args.logfile:
+        logging.basicConfig( filename=args.logfile, level=log_level )
+    else:
+        logging.basicConfig(level=log_level)
 
-#     program_options['file_extension'] = args.fileext.lower()
-#     program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
-# #    program_options['gpx_file_folder'] = args.gpx_file_folder
-#     program_options['laptop_destination_folder'] = args.laptop_destination_folder
-#     program_options['travel_storage_media_folders'] = args.travel_storage_media_folder
-#
-#     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
+    if args.sourcedir:
+        program_options['sourcedirs'] = sorted(args.sourcedir)
+    else:
+        program_options['sourcedirs'] = []
+
+    program_options['file_extension'] = args.raw_file_fileext.lower()
+    program_options['timestamp_utc_offset_hours'] = args.timestamp_utc_offset_hours
+    program_options['destination_folders'] = args.travel_storage_media_folder
+
+    logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 #
 #     perf_timer = performance_timer.PerformanceTimer()
 #
