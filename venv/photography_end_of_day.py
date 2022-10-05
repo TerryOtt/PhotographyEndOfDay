@@ -4,7 +4,7 @@ import logging
 import json
 import os
 import sys
-import exiftool
+import exiftool             # Requires pip3 install pyexiftool >= 0.5
 import datetime
 
 curr_processes_running = 1
