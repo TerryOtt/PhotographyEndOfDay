@@ -7,29 +7,7 @@ import sys
 import exiftool
 import datetime
 
-# import pprint
-# import json
-# import logging
-# import time
-# import os
-# import hashlib
-# import multiprocessing
-# import queue
-# import exiftool
-# import datetime
-# import shutil
-# import pathlib
-# import glob
-# import performance_timer
-# import random
-# import shutil
-# import xml.etree.ElementTree
-# import copy
-
-
-#num_worker_processes = multiprocessing.cpu_count() - 2
-# max_processes_running = 15
-# curr_processes_running = 1
+curr_processes_running = 1
 
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="End of day script to create validated travel copies of all pics")
@@ -73,7 +51,7 @@ def _parse_args():
 def _scan_source_dir_for_images( curr_source_dir, program_options ):
     image_files = []
     cumulative_bytes = 0
-    print(f"\tStarting file walk of {curr_source_dir}")
+    print(f"\tFinding \".{program_options['file_extension']}\" files in sourcedir \"{curr_source_dir}\"")
 
     for subdir, dirs, files in os.walk(curr_source_dir):
         for filename in files:
@@ -121,7 +99,7 @@ def _enumerate_source_images(program_options):
             # Store a reference into the source array keyed by absolute filename so we can do a quick update with the timestamp
             reverse_map[ curr_file_entry['file_path']['absolute'] ] = source_file_lists[curr_sourcedir][index]
 
-    print( f"Reverse map created:\n{json.dumps(reverse_map, indent=4, sort_keys=True)}")
+    #print( f"Reverse map created:\n{json.dumps(reverse_map, indent=4, sort_keys=True)}")
 
     raw_file_list.sort()
 
@@ -129,7 +107,7 @@ def _enumerate_source_images(program_options):
         exiftool_tag_name = "EXIF:DateTimeOriginal"
         file_timestamps = exiftool_handle.get_tags( raw_file_list, tags = [ exiftool_tag_name] )
 
-    print( f"Timestamp results:\n{json.dumps(file_timestamps, indent=4, sort_keys=True)}")
+    #print( f"Timestamp results:\n{json.dumps(file_timestamps, indent=4, sort_keys=True)}")
 
     for curr_timestamp_entry in file_timestamps:
         file_datetime_no_tz = datetime.datetime.strptime(curr_timestamp_entry[exiftool_tag_name], "%Y:%m:%d %H:%M:%S")
@@ -149,7 +127,7 @@ def _enumerate_source_images(program_options):
             logging.error( "Contents of source dirs do not match, bailing")
             sys.exit( 1 )
 
-    print( "\tContents of all sourcedirs match!")
+    print( "\tMetadata contents of all sourcedirs match!")
 
     total_file_count = len( source_file_lists[program_options['sourcedirs'][0]] )
 
@@ -168,6 +146,49 @@ def _enumerate_source_images(program_options):
         'source_file_dict' : file_dict,
         'total_file_count'  : total_file_count
     }
+
+
+def _set_destination_filenames( program_options, source_image_info ):
+    print("\nDetermining unique filenames in destination storage directories")
+    destination_dir_prefix = program_options['destination_folders'][0]
+
+    # Resolve filename conflicts in the YYYY/YYYY-MM-DD destination dir
+    filename_conflicts_found = 0
+    for source_filename in source_image_info:
+        logging.debug( f"Determining unique destination filename for {source_filename}")
+        year = source_image_info[source_filename]['timestamp'].year
+        yearmonthday = source_image_info[source_filename]['timestamp'].isoformat()[:10]
+
+        #print( f"Destination path: {destination_path}")
+        source_image_info[source_filename]['destination'] = {
+            'relative_directory'    : os.path.join( str(year), yearmonthday ),
+        }
+
+        # Check to see if relative path is clear
+        destination_path = os.path.join(destination_dir_prefix, str(year), yearmonthday, source_filename)
+
+        unique_extension = 1
+        if os.path.exists(destination_path):
+            filename_conflicts_found += 1
+            while os.path.exists(destination_path):
+                (filename_no_extension, filename_extension) = os.path.splitext( source_filename)
+                destination_path = os.path.join(destination_dir_prefix, str(year), yearmonthday,
+                                                f"{filename_no_extension}_{unique_extension:04d}{filename_extension}")
+                unique_extension += 1
+            source_image_info[source_filename]['destination']['unique_relative_destination_path'] = \
+                os.path.join(str(year), yearmonthday,
+                             f"{filename_no_extension}_{(unique_extension - 1):04d}{filename_extension}")
+        else:
+            source_image_info[source_filename]['destination']['unique_relative_destination_path'] = \
+                os.path.join( str(year), yearmonthday, source_filename )
+
+    #print( f"Updated source file info:\n{json.dumps(source_image_info, indent=4, sort_keys=True, default=str)}")
+
+#    num_files = len(source_image_info)
+    num_files = 4567
+    #no_conflict_count = num_files - filename_conflicts_found
+    print( f"\t{num_files:6,} file(s) have had their unique destination paths determined")
+    print( f"\t{filename_conflicts_found:6,} file(s) had to have their destination paths updated due to existing files in the destination dir")
 
 
 def _main():
@@ -196,32 +217,10 @@ def _main():
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
     source_image_info = _enumerate_source_images(program_options)
-    print( "\nSource file info:\n" + json.dumps(source_image_info['source_file_dict'],
-                                                                 indent=4, sort_keys=True, default=str) )
-#
-#     manifest_info = _generate_source_manifest( source_image_info['reverse_map'],
-#                                                source_image_info['source_file_list'] )
-#     # Delete the reverse map, don't need it anymore
-#     del source_image_info['reverse_map']
-#     perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
-#     source_file_manifest = manifest_info['source_manifest']
-#
-#     # Get timestamp for all image files
-#     timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
-#     perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
-#
-#     # Enumerate files already in the destination directory
-#     destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
-#     perf_timer.add_perf_timing( "Listing existing files in destination folder",
-#                                 destination_files_results['operation_time_seconds'] )
-#     existing_destination_files = destination_files_results['existing_files']
-#
-#     # Determine unique filenames
-#     set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest,
-#                                                                     existing_destination_files )
-#     perf_timer.add_perf_timing( 'Generating unique destination filenames',
-#                       set_destination_filenames_results['operation_time_seconds'] )
-#     destination_file_manifests = set_destination_filenames_results['destination_file_manifests']
+    #print( "\nSource file info:\n" + json.dumps(source_image_info['source_file_dict'],
+    #                                                             indent=4, sort_keys=True, default=str) )
+    # Determine unique filenames
+    set_destination_filenames_results = _set_destination_filenames( program_options, source_image_info['source_file_dict'] )
 #
 #     # Do file copies to laptop NVMe SSD
 #     copy_operation_results = _do_file_copies_to_laptop(program_options, source_file_manifest)
