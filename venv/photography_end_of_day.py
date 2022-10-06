@@ -3,6 +3,7 @@ import multiprocessing
 import logging
 import json
 import os
+import queue
 import sys
 import exiftool             # Requires pip3 install pyexiftool >= 0.5
 import datetime
@@ -200,6 +201,88 @@ def _set_destination_filenames( program_options, source_image_info ):
     print( f"\t{filename_conflicts_found:6,} \".{program_options['file_extension']}\" file(s) had to have their destination paths updated due to existing files in the destination dir")
 
 
+def _create_destination_writer_pipes( program_options ):
+    destination_writer_pipe_connections = []
+    duplex_pipe = False
+    for curr_destination_folder in range(len(program_options['destination_folders'])):
+        destination_writer_pipe_connections.append( multiprocessing.Pipe(duplex_pipe) )
+
+    return destination_writer_pipe_connections
+
+
+def _write_to_destination_folder_worker( pipe_read_connection, destination_folder,
+                                         number_of_sourcedirs,
+                                         display_console_messages_queue):
+
+    worker_starting_msg = {
+        "msg_level"         : logging.DEBUG,
+        "msg"               : f"Worker process to write data to \"{destination_folder}\" has started",
+    }
+
+    display_console_messages_queue.put( worker_starting_msg )
+
+    # Read out of pipe until it's closed
+    sourcedirs_still_writing = number_of_sourcedirs
+    while ( sourcedirs_still_writing > 0 ):
+        data_received = pipe_read_connection.recv()
+
+        # See if it's a "done writing" message
+        if data_received['message_type'] == "DONE_WRITING":
+            sourcedirs_still_writing -= 1
+            ending_write_msg = {
+                "msg_level"     : logging.DEBUG,
+                "msg"           : f"Destination writer for {destination_folder} got DONE_WRITING msg " + \
+                    f"from sourcedir {data_received['sourcedir']}"
+            }
+            display_console_messages_queue.put(ending_write_msg)
+        elif data_received['message_type'] == "DATA_BLOCK":
+            formulated_path = os.path.join( destination_folder, data_received['relative_path'])
+            display_message = f"Writing data to {formulated_path}"
+            writing_data_msg = {
+                "msg_level"     : logging.DEBUG,
+                "msg"           : display_message,
+            }
+            display_console_messages_queue.put( writing_data_msg)
+
+    worker_exiting_msg = {
+        "msg_level"     : logging.DEBUG,
+        "msg"           : f"Destination writer for {destination_folder} exiting cleanly"
+    }
+
+    display_console_messages_queue.put(worker_exiting_msg)
+
+
+def _launch_destination_writers(program_options, display_console_messages_queue, source_image_info ):
+    destination_writer_pipe_connections = _create_destination_writer_pipes(program_options)
+
+    global curr_processes_running
+
+    writer_process_handles = []
+
+    #print( f"Source image info:\n{json.dumps(source_image_info, indent=4, sort_keys=True, default=str)}" )
+
+    number_of_sourcedirs = len(program_options['sourcedirs'])
+
+    # Create processes to write to each destination
+    for (i, curr_dest_folder) in enumerate(program_options['destination_folders']):
+        curr_handle = multiprocessing.Process(target=_write_to_destination_folder_worker,
+                                              args=( destination_writer_pipe_connections[i][0],
+                                                     curr_dest_folder,
+                                                     number_of_sourcedirs,
+                                                     display_console_messages_queue) )
+
+        writer_process_handles.append( curr_handle )
+        curr_handle.start()
+        curr_processes_running += 1
+
+    return_dict = {
+        "pipe_connections"          : destination_writer_pipe_connections,
+        "writer_process_handles"    : writer_process_handles,
+    }
+
+    return return_dict
+
+
 def _main():
     args = _parse_args()
     program_options = {}
@@ -228,57 +311,44 @@ def _main():
     source_image_info = _enumerate_source_images(program_options)
     #print( "\nSource file info:\n" + json.dumps(source_image_info['source_file_dict'],
     #                                                             indent=4, sort_keys=True, default=str) )
-    # Determine unique filenames
-    set_destination_filenames_results = _set_destination_filenames( program_options, source_image_info['source_file_dict'] )
-#
-#     # Do file copies to laptop NVMe SSD
-#     copy_operation_results = _do_file_copies_to_laptop(program_options, source_file_manifest)
-#     perf_timer.add_perf_timing( 'Copying RAW files to laptop NVMe',
-#                      copy_operation_results['operation_time_seconds'])
-#
-#     # Do readback validation to make sure all writes to laptop worked
-#     print("\nReading files back from laptop SSD to verify contents still match original hash")
-#     verify_operation_results = _do_readback_validation( source_file_manifest, program_options )
-#     print( "\tDone")
-#     perf_timer.add_perf_timing( 'Validating all writes to laptop NVMe SSD are still byte-identical to source',
-#         verify_operation_results['operation_time_seconds'])
-#
-#     # Create XMP sidecar files
-# #    print("\nCreating geotagged XMP sidecar files for all RAW images")
-# #    xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
-# #    print( "\tDone")
-# #    perf_timer.add_perf_timing(  'Generating geotagged XMP files', xmp_generation_results['operation_time_seconds'])
-#
-#     # Pull geotags out of XMP and store in manifest
-# #    print( "\nUpdating manifest with geotag and XMP hash data")
-# #    geotag_and_timestamp_manifest_update_results = _update_manifest_with_geotags( program_options,
-# #                                                                                  destination_file_manifests )
-# #    print( "\tDone" )
-# #    perf_timer.add_perf_timing( "Adding geotags and XMP file hashes to manifest", geotag_and_timestamp_manifest_update_results['operation_time_seconds'])
-#
-#     # Create (or update) daily manifest files
-#     print( "\nWriting or updating per-day manifest files" )
-#     manifest_write_results = _write_manifest_files( program_options, destination_file_manifests )
-#     print( "\tDone")
-#     perf_timer.add_perf_timing( "Writing per-day manifest files to disk",
-#                                 manifest_write_results['operation_time_seconds'] )
-#
-#     # Copy from laptop to external storage
-#     external_copies_time_seconds = _copy_files_to_external_storage( program_options, source_file_manifest )
-#     perf_timer.add_perf_timing( 'Copying all files from laptop to all travel storage media devices',
-#                                  external_copies_time_seconds )
-#
-#     # Validate external storage copies
-#     print( "\nVerifying all travel media copies")
-#     travel_media_verify_time_seconds = _verify_travel_media_copies( program_options, destination_file_manifests )
-#     print( "\tDone")
-#     perf_timer.add_perf_timing( "Verifying all travel media copies match original hashes",
-#                                 travel_media_verify_time_seconds )
-#
-#     # Final perf print
-#     print( "" )
-#     perf_timer.display_performance()
 
+    # Determine unique filenames
+    _set_destination_filenames( program_options, source_image_info['source_file_dict'] )
+
+    # Create queue that all children use to send messages for display back up to parent
+    display_console_messages_queue = multiprocessing.Queue()
+
+    # Launch destination writers
+    destination_writers = _launch_destination_writers( program_options, display_console_messages_queue,
+                                                       source_image_info )
+
+    # Send "done writing" messages to all writers for a test
+    for (i, curr_sourcedir) in enumerate(program_options['sourcedirs']):
+        for j in range(len(program_options['destination_folders'])):
+            done_writing_msg = {
+                "sourcedir"     : curr_sourcedir,
+                "message_type"  : "DONE_WRITING",
+            }
+            destination_writers['pipe_connections'][j][1].send( done_writing_msg )
+
+
+    # Read out all messages from the display queue
+    blocking_read = True
+    read_timeout_seconds = 0.1
+    try:
+        while True:
+            process_started_msg = display_console_messages_queue.get(blocking_read, read_timeout_seconds)
+            print( f"Parent got message to display: \"{process_started_msg['msg']}\"")
+    except queue.Empty:
+        print( f"Parent has emptied the console message display queue, breaking out of loop")
+
+    while( len(destination_writers['writer_process_handles']) > 0 ):
+        curr_handle = destination_writers['writer_process_handles'].pop()
+        print( "Parent waiting for child process to rejoin" )
+        curr_handle.join()
+        print( "Parent had child process rejoin")
+
+    print( "parent terminating cleanly" )
 
 if __name__ == "__main__":
     _main()
