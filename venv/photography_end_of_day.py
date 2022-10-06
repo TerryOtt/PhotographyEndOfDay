@@ -235,8 +235,29 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
             }
             display_console_messages_queue.put(ending_write_msg)
         elif data_received['message_type'] == "DATA_BLOCK":
-            formulated_path = os.path.join( destination_folder, data_received['relative_path'])
-            display_message = f"Writing data to {formulated_path}"
+            #formulated_path = os.path.join( destination_folder, data_received['relative_path'])
+            relative_path = data_received['file_info']['relative_path']
+            relative_dir = data_received['file_info']['relative_dir']
+            sourcedir = data_received['file_info']['sourcedir']
+            byte_start = data_received['data_block']['block_byte_start']
+            payload_len = data_received['data_block']['block_num_bytes']
+            byte_end = data_received['data_block']['block_byte_end']
+            total_file_size = data_received['file_info']['total_file_size']
+            file_payload = data_received['data_block']['block_payload']
+
+            # Create any missing directories along the path
+            destination_dir_absolute_path = os.path.join( destination_folder, relative_dir)
+            if os.path.isdir( destination_dir_absolute_path ) is False:
+                os.makedirs( destination_dir_absolute_path )
+
+            destination_absolute_path = os.path.join( destination_folder, relative_path )
+            # file flags:
+            #   a = "append" mode (all writes will be done at end of the file)
+            #   b = "binary" mode (all writes are on bytes vs strings)
+            with open( destination_absolute_path, "ab" ) as file_handle:
+                file_handle.write( file_payload )
+
+            display_message = f"Destination writer for {destination_folder} got data block from {sourcedir} for {relative_path}, starting at byte {byte_start}, len={payload_len}, ending byte={byte_end}, total file size={total_file_size}"
             writing_data_msg = {
                 "msg_level"     : logging.DEBUG,
                 "msg"           : display_message,
@@ -290,6 +311,49 @@ def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
 
     display_console_messages_queue.put( worker_starting_msg )
 
+    # Max block size = 1MB
+    max_block_size = 1024 * 1024
+
+    for curr_input_file in source_image_info:
+        curr_input_file_data = source_image_info[curr_input_file]
+        print( "Input file:\n" + json.dumps(curr_input_file_data, indent=4, sort_keys=True, default=str))
+
+        # Loop over block-sized chunks in the file
+        curr_file_offset = 0
+        sourcefile_absolute_path = os.path.join( curr_sourcedir, curr_input_file )
+        curr_file_size = os.path.getsize(sourcefile_absolute_path)
+        #print( f"Sourcefile {sourcefile_absolute_path} has file size of {curr_file_size} bytes")
+        with open( sourcefile_absolute_path, "rb") as file_handle:
+            while curr_file_offset + 1 < curr_file_size:
+                bytes_for_block = min( curr_file_size - curr_file_offset, max_block_size )
+                #print( f"Bytes for block: {bytes_for_block}")
+
+                data_block_payload_bytes = file_handle.read(bytes_for_block)
+
+                data_block_msg = {
+                    'message_type'  : "DATA_BLOCK",
+                    'file_info'     : {
+                        'sourcedir'         : curr_sourcedir,
+                        'relative_path'     : curr_input_file_data['destination']['unique_relative_destination_path'],
+                        'total_file_size'   : curr_file_size,
+                        'relative_dir'      : curr_input_file_data['destination']['relative_directory'],
+                    },
+                    "data_block": {
+                        "block_byte_start"  : curr_file_offset + 1,
+                        "block_num_bytes"   : bytes_for_block,
+                        "block_byte_end"    : curr_file_offset + bytes_for_block,
+                        "block_payload"     : data_block_payload_bytes,
+                    }
+                }
+
+                # Write the block to all destinations
+                for curr_writer_queue in destination_writer_queues:
+                    curr_writer_queue.put(data_block_msg)
+
+                #print( "Wrote following block to all destinations:\n" + json.dumps(data_block_msg, indent=4, sort_keys=True, default=str))
+
+                curr_file_offset += bytes_for_block
+
     done_writing_msg = {
         "sourcedir"     : curr_sourcedir,
         "message_type"  : "DONE_WRITING",
@@ -312,11 +376,11 @@ def _launch_sourcedir_readers( program_options, source_image_info, display_conso
     global curr_processes_running
 
     reader_process_handles = []
-    print( f"Destination writers:\n{json.dumps(destination_writers, indent=4, sort_keys=True, default=str)}")
+    #print( f"Destination writers:\n{json.dumps(destination_writers, indent=4, sort_keys=True, default=str)}")
 
     for ( i, curr_sourcedir ) in enumerate( program_options['sourcedirs']):
         curr_handle = multiprocessing.Process( target=_read_from_sourcedir_worker,
-                                               args=(curr_sourcedir, source_image_info,
+                                               args=(curr_sourcedir, source_image_info['source_file_dict'],
                                                      display_console_messages_queue,
                                                      destination_writers['writer_queues']) )
         reader_process_handles.append( curr_handle )
