@@ -201,13 +201,12 @@ def _set_destination_filenames( program_options, source_image_info ):
     print( f"\t{filename_conflicts_found:6,} \".{program_options['file_extension']}\" file(s) had to have their destination paths updated due to existing files in the destination dir")
 
 
-def _create_destination_writer_pipes( program_options ):
-    destination_writer_pipe_connections = []
-    duplex_pipe = False
+def _create_destination_writer_queues( program_options ):
+    destination_writer_queues = []
     for curr_destination_folder in range(len(program_options['destination_folders'])):
-        destination_writer_pipe_connections.append( multiprocessing.Pipe(duplex_pipe) )
+        destination_writer_queues.append( multiprocessing.SimpleQueue() )
 
-    return destination_writer_pipe_connections
+    return destination_writer_queues
 
 
 def _write_to_destination_folder_worker( pipe_read_connection, destination_folder,
@@ -224,7 +223,7 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
     # Read out of pipe until it's closed
     sourcedirs_still_writing = number_of_sourcedirs
     while ( sourcedirs_still_writing > 0 ):
-        data_received = pipe_read_connection.recv()
+        data_received = pipe_read_connection.get()
 
         # See if it's a "done writing" message
         if data_received['message_type'] == "DONE_WRITING":
@@ -252,21 +251,19 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
     display_console_messages_queue.put(worker_exiting_msg)
 
 
-def _launch_destination_writers(program_options, display_console_messages_queue, source_image_info ):
-    destination_writer_pipe_connections = _create_destination_writer_pipes(program_options)
+def _launch_destination_writers(program_options, display_console_messages_queue ):
+    destination_writer_queues = _create_destination_writer_queues(program_options)
 
     global curr_processes_running
 
     writer_process_handles = []
-
-    #print( f"Source image info:\n{json.dumps(source_image_info, indent=4, sort_keys=True, default=str)}" )
 
     number_of_sourcedirs = len(program_options['sourcedirs'])
 
     # Create processes to write to each destination
     for (i, curr_dest_folder) in enumerate(program_options['destination_folders']):
         curr_handle = multiprocessing.Process(target=_write_to_destination_folder_worker,
-                                              args=( destination_writer_pipe_connections[i][0],
+                                              args=( destination_writer_queues[i],
                                                      curr_dest_folder,
                                                      number_of_sourcedirs,
                                                      display_console_messages_queue) )
@@ -276,12 +273,57 @@ def _launch_destination_writers(program_options, display_console_messages_queue,
         curr_processes_running += 1
 
     return_dict = {
-        "pipe_connections"          : destination_writer_pipe_connections,
+        "writer_queues"             : destination_writer_queues,
         "writer_process_handles"    : writer_process_handles,
     }
 
     return return_dict
 
+
+def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
+                                 display_console_messages_queue, destination_writer_queues ):
+
+    worker_starting_msg = {
+        "msg_level"         : logging.DEBUG,
+        "msg"               : f"Worker process to read data from sourcedir \"{curr_sourcedir}\" has started",
+    }
+
+    display_console_messages_queue.put( worker_starting_msg )
+
+    done_writing_msg = {
+        "sourcedir"     : curr_sourcedir,
+        "message_type"  : "DONE_WRITING",
+    }
+
+    for curr_writer_queue in destination_writer_queues:
+        curr_writer_queue.put( done_writing_msg )
+
+    worker_terminating_msg = {
+        "msg_level"         : logging.DEBUG,
+        "msg"               : f"Worker process to read data from sourcedir \"{curr_sourcedir}\" exiting cleanly",
+    }
+
+    display_console_messages_queue.put( worker_terminating_msg )
+
+
+def _launch_sourcedir_readers( program_options, source_image_info, display_console_messages_queue,
+                               destination_writers ):
+
+    global curr_processes_running
+
+    reader_process_handles = []
+    print( f"Destination writers:\n{json.dumps(destination_writers, indent=4, sort_keys=True, default=str)}")
+
+    for ( i, curr_sourcedir ) in enumerate( program_options['sourcedirs']):
+        curr_handle = multiprocessing.Process( target=_read_from_sourcedir_worker,
+                                               args=(curr_sourcedir, source_image_info,
+                                                     display_console_messages_queue,
+                                                     destination_writers['writer_queues']) )
+        reader_process_handles.append( curr_handle )
+        curr_handle.start()
+        curr_processes_running += 1
+
+    return reader_process_handles
 
 def _main():
     args = _parse_args()
@@ -318,19 +360,15 @@ def _main():
     # Create queue that all children use to send messages for display back up to parent
     display_console_messages_queue = multiprocessing.Queue()
 
+    # TODO: launch checksum workers
+
     # Launch destination writers
-    destination_writers = _launch_destination_writers( program_options, display_console_messages_queue,
-                                                       source_image_info )
+    destination_writers = _launch_destination_writers( program_options, display_console_messages_queue )
 
-    # Send "done writing" messages to all writers for a test
-    for (i, curr_sourcedir) in enumerate(program_options['sourcedirs']):
-        for j in range(len(program_options['destination_folders'])):
-            done_writing_msg = {
-                "sourcedir"     : curr_sourcedir,
-                "message_type"  : "DONE_WRITING",
-            }
-            destination_writers['pipe_connections'][j][1].send( done_writing_msg )
-
+    # Launch sourcedir readers
+    sourcedir_readers = _launch_sourcedir_readers( program_options, source_image_info,
+                                                   display_console_messages_queue,
+                                                   destination_writers )
 
     # Read out all messages from the display queue
     blocking_read = True
@@ -342,11 +380,17 @@ def _main():
     except queue.Empty:
         print( f"Parent has emptied the console message display queue, breaking out of loop")
 
-    while( len(destination_writers['writer_process_handles']) > 0 ):
+    while len(sourcedir_readers) > 0:
+        curr_reader_handle = sourcedir_readers.pop()
+        print( "Parent waiting for sourcedir reader child process to rejoin")
+        curr_reader_handle.join()
+        print( "Parent had sourcedir reader child process rejoin")
+
+    while len(destination_writers['writer_process_handles']) > 0:
         curr_handle = destination_writers['writer_process_handles'].pop()
-        print( "Parent waiting for child process to rejoin" )
+        print( "Parent waiting for destination writer child process to rejoin" )
         curr_handle.join()
-        print( "Parent had child process rejoin")
+        print( "Parent had destination writer child process rejoin")
 
     print( "parent terminating cleanly" )
 
