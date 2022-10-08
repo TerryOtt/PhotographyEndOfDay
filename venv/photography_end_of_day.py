@@ -7,6 +7,7 @@ import queue
 import sys
 import exiftool             # Requires pip3 install pyexiftool >= 0.5
 import datetime
+import checksum_mgr
 
 curr_processes_running = 1
 
@@ -211,7 +212,8 @@ def _create_destination_writer_queues( program_options ):
 
 def _write_to_destination_folder_worker( pipe_read_connection, destination_folder,
                                          number_of_sourcedirs,
-                                         display_console_messages_queue):
+                                         display_console_messages_queue,
+                                         checksum_update_queue):
 
     worker_starting_msg = {
         "msg_level"         : logging.DEBUG,
@@ -257,12 +259,12 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
             with open( destination_absolute_path, "ab" ) as file_handle:
                 file_handle.write( file_payload )
 
-            display_message = f"Destination writer for {destination_folder} got data block from {sourcedir} for {relative_path}, starting at byte {byte_start}, len={payload_len}, ending byte={byte_end}, total file size={total_file_size}"
-            writing_data_msg = {
-                "msg_level"     : logging.DEBUG,
-                "msg"           : display_message,
-            }
-            display_console_messages_queue.put( writing_data_msg)
+            # display_message = f"Destination writer for {destination_folder} got data block from {sourcedir} for {relative_path}, starting at byte {byte_start}, len={payload_len}, ending byte={byte_end}, total file size={total_file_size}"
+            # writing_data_msg = {
+            #     "msg_level"     : logging.DEBUG,
+            #     "msg"           : display_message,
+            # }
+            # display_console_messages_queue.put( writing_data_msg)
 
     worker_exiting_msg = {
         "msg_level"     : logging.DEBUG,
@@ -272,7 +274,7 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
     display_console_messages_queue.put(worker_exiting_msg)
 
 
-def _launch_destination_writers(program_options, display_console_messages_queue ):
+def _launch_destination_writers(program_options, display_console_messages_queue, checksum_update_queue ):
     destination_writer_queues = _create_destination_writer_queues(program_options)
 
     global curr_processes_running
@@ -287,7 +289,8 @@ def _launch_destination_writers(program_options, display_console_messages_queue 
                                               args=( destination_writer_queues[i],
                                                      curr_dest_folder,
                                                      number_of_sourcedirs,
-                                                     display_console_messages_queue) )
+                                                     display_console_messages_queue,
+                                                     checksum_update_queue) )
 
         writer_process_handles.append( curr_handle )
         curr_handle.start()
@@ -302,7 +305,8 @@ def _launch_destination_writers(program_options, display_console_messages_queue 
 
 
 def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
-                                 display_console_messages_queue, destination_writer_queues ):
+                                 display_console_messages_queue, destination_writer_queues,
+                                 checksum_update_queue):
 
     worker_starting_msg = {
         "msg_level"         : logging.DEBUG,
@@ -316,7 +320,7 @@ def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
 
     for curr_input_file in source_image_info:
         curr_input_file_data = source_image_info[curr_input_file]
-        print( "Input file:\n" + json.dumps(curr_input_file_data, indent=4, sort_keys=True, default=str))
+        #print( "Input file:\n" + json.dumps(curr_input_file_data, indent=4, sort_keys=True, default=str))
 
         # Loop over block-sized chunks in the file
         curr_file_offset = 0
@@ -329,6 +333,22 @@ def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
                 #print( f"Bytes for block: {bytes_for_block}")
 
                 data_block_payload_bytes = file_handle.read(bytes_for_block)
+
+                # Write the data block for checksumming
+                checksum_update_request_msg = {
+                    'file_info'     : {
+                        'absolute_path'     : sourcefile_absolute_path,
+                        'relative_path'     : curr_input_file_data['destination']['unique_relative_destination_path'],
+                    },
+                    'data_block'    : {
+                        "block_byte_start"  : curr_file_offset + 1,
+                        "block_num_bytes"   : bytes_for_block,
+                        "block_byte_end"    : curr_file_offset + bytes_for_block,
+                        "block_payload"     : data_block_payload_bytes,
+                    },
+                }
+
+                checksum_update_queue.put( checksum_update_request_msg )
 
                 data_block_msg = {
                     'message_type'  : "DATA_BLOCK",
@@ -371,7 +391,8 @@ def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
 
 
 def _launch_sourcedir_readers( program_options, source_image_info, display_console_messages_queue,
-                               destination_writers ):
+                               destination_writers,
+                               checksum_update_queue ):
 
     global curr_processes_running
 
@@ -382,7 +403,8 @@ def _launch_sourcedir_readers( program_options, source_image_info, display_conso
         curr_handle = multiprocessing.Process( target=_read_from_sourcedir_worker,
                                                args=(curr_sourcedir, source_image_info['source_file_dict'],
                                                      display_console_messages_queue,
-                                                     destination_writers['writer_queues']) )
+                                                     destination_writers['writer_queues'],
+                                                     checksum_update_queue) )
         reader_process_handles.append( curr_handle )
         curr_handle.start()
         curr_processes_running += 1
@@ -424,25 +446,31 @@ def _main():
     # Create queue that all children use to send messages for display back up to parent
     display_console_messages_queue = multiprocessing.Queue()
 
-    # TODO: launch checksum workers
+    checksum_manager = checksum_mgr.ChecksumManager(len(source_image_info['source_file_dict']) *
+                                                    (len(program_options['sourcedirs']) +
+                                                     len(program_options['destination_folders'])),
+                                                    display_console_messages_queue)
 
     # Launch destination writers
-    destination_writers = _launch_destination_writers( program_options, display_console_messages_queue )
+    destination_writers = _launch_destination_writers( program_options, display_console_messages_queue,
+                                                       checksum_manager.checksum_update_queue)
 
     # Launch sourcedir readers
     sourcedir_readers = _launch_sourcedir_readers( program_options, source_image_info,
                                                    display_console_messages_queue,
-                                                   destination_writers )
+                                                   destination_writers,
+                                                   checksum_manager.checksum_update_queue)
 
     # Read out all messages from the display queue
     blocking_read = True
     read_timeout_seconds = 0.1
     try:
+        print( "\n\n")
         while True:
             process_started_msg = display_console_messages_queue.get(blocking_read, read_timeout_seconds)
             print( f"Parent got message to display: \"{process_started_msg['msg']}\"")
     except queue.Empty:
-        print( f"Parent has emptied the console message display queue, breaking out of loop")
+        print( f"\nParent has emptied the console message display queue, breaking out of loop\n")
 
     while len(sourcedir_readers) > 0:
         curr_reader_handle = sourcedir_readers.pop()
