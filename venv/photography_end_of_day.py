@@ -222,6 +222,9 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
 
     display_console_messages_queue.put( worker_starting_msg )
 
+    # Keep track of what files this destination writer has decided to write to disk
+    files_being_written_to_disk = {}
+
     # Read out of pipe until it's closed
     sourcedirs_still_writing = number_of_sourcedirs
     while ( sourcedirs_still_writing > 0 ):
@@ -237,6 +240,8 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
             }
             display_console_messages_queue.put(ending_write_msg)
         elif data_received['message_type'] == "DATA_BLOCK":
+
+
             #formulated_path = os.path.join( destination_folder, data_received['relative_path'])
             relative_path = data_received['file_info']['relative_path']
             relative_dir = data_received['file_info']['relative_dir']
@@ -247,24 +252,60 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
             total_file_size = data_received['file_info']['total_file_size']
             file_payload = data_received['data_block']['block_payload']
 
-            # Create any missing directories along the path
-            destination_dir_absolute_path = os.path.join( destination_folder, relative_dir)
-            if os.path.isdir( destination_dir_absolute_path ) is False:
-                os.makedirs( destination_dir_absolute_path )
+            # Let's see if we're going to write this update to disk or just ignore it
+            if relative_path not in files_being_written_to_disk:
+                # We're definitely going to write this bad boy to disk
+                write_block_to_disk = True
 
-            destination_absolute_path = os.path.join( destination_folder, relative_path )
-            # file flags:
-            #   a = "append" mode (all writes will be done at end of the file)
-            #   b = "binary" mode (all writes are on bytes vs strings)
-            with open( destination_absolute_path, "ab" ) as file_handle:
-                file_handle.write( file_payload )
+                # Record the relevant info so we know if it's a duplicate or not
+                files_being_written_to_disk[ relative_path ] = {
+                    'sourcedir' : sourcedir
+                }
+            # As long as the sourcedir matches the one we're writing, we'll act on the write request
+            elif files_being_written_to_disk[relative_path]['sourcedir'] == sourcedir:
+                write_block_to_disk = True
 
-            # display_message = f"Destination writer for {destination_folder} got data block from {sourcedir} for {relative_path}, starting at byte {byte_start}, len={payload_len}, ending byte={byte_end}, total file size={total_file_size}"
-            # writing_data_msg = {
-            #     "msg_level"     : logging.DEBUG,
-            #     "msg"           : display_message,
-            # }
-            # display_console_messages_queue.put( writing_data_msg)
+            # This write came from a different sourcedir, so just politely but firmly discard the request
+            else:
+                write_block_to_disk = False
+
+            if write_block_to_disk:
+                # Is this the first data block for the file?
+                if byte_start == 1:
+                    # Create missing directories along the path, if any
+                    destination_dir_absolute_path = os.path.join( destination_folder, relative_dir)
+                    if os.path.isdir( destination_dir_absolute_path ) is False:
+                        os.makedirs( destination_dir_absolute_path )
+
+                    # Open for write (create) in binary mode
+                    open_flags = "wb"
+                else:
+                    # Open for append in binary mode
+                    open_flags = "ab"
+
+                destination_absolute_path = os.path.join(destination_folder, relative_path)
+                with open( destination_absolute_path, open_flags ) as file_handle:
+                    file_handle.write( file_payload )
+
+                # display_message = f"Destination writer for {destination_folder} got data block from {sourcedir} for {relative_path}, starting at byte {byte_start}, len={payload_len}, ending byte={byte_end}, total file size={total_file_size}"
+                # writing_data_msg = {
+                #     "msg_level"     : logging.DEBUG,
+                #     "msg"           : display_message,
+                # }
+                # display_console_messages_queue.put( writing_data_msg)
+
+                # If this is the last block we wrote out, note that the file we just finished writing needs
+                #       checksumming
+                if byte_end == total_file_size:
+                    checksum_msg = {
+                        'file_info': {
+                            'absolute_path' : destination_absolute_path,
+                            'relative_path' : relative_path,
+                        }
+                    }
+
+                    checksum_update_queue.put( checksum_msg)
+
 
     worker_exiting_msg = {
         "msg_level"     : logging.DEBUG,
@@ -339,6 +380,7 @@ def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
                     'file_info'     : {
                         'absolute_path'     : sourcefile_absolute_path,
                         'relative_path'     : curr_input_file_data['destination']['unique_relative_destination_path'],
+                        'total_file_size'   : curr_file_size,
                     },
                     'data_block'    : {
                         "block_byte_start"  : curr_file_offset + 1,
@@ -463,7 +505,7 @@ def _main():
 
     # Read out all messages from the display queue
     blocking_read = True
-    read_timeout_seconds = 0.1
+    read_timeout_seconds = 2.0
     try:
         print( "\n\n")
         while True:
@@ -471,6 +513,11 @@ def _main():
             print( f"Parent got message to display: \"{process_started_msg['msg']}\"")
     except queue.Empty:
         print( f"\nParent has emptied the console message display queue, breaking out of loop\n")
+
+    # Now let's wait for checksum data to come in
+    checksum_manager.validate_all_checksums_match()
+
+    # Now clean up the reader/writer processes
 
     while len(sourcedir_readers) > 0:
         curr_reader_handle = sourcedir_readers.pop()
