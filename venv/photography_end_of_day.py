@@ -475,6 +475,7 @@ def _main():
     program_options['file_extension'] = args.raw_file_fileext.lower()
     program_options['timestamp_utc_offset_hours'] = args.timestamp_utc_offset_hours
     program_options['destination_folders'] = args.travel_storage_media_folder
+    program_options['max_processes'] = args.max_processes
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
@@ -488,10 +489,14 @@ def _main():
     # Create queue that all children use to send messages for display back up to parent
     display_console_messages_queue = multiprocessing.Queue()
 
+    number_of_checksum_workers_allowed = (program_options['max_processes'] -
+        len(program_options['sourcedirs']) - len(program_options['destination_folders']))
+
     checksum_manager = checksum_mgr.ChecksumManager(len(source_image_info['source_file_dict']) *
                                                     (len(program_options['sourcedirs']) +
                                                      len(program_options['destination_folders'])),
-                                                    display_console_messages_queue)
+                                                    display_console_messages_queue,
+                                                    number_of_checksum_workers_allowed)
 
     # Launch destination writers
     destination_writers = _launch_destination_writers( program_options, display_console_messages_queue,
