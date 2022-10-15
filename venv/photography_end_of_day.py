@@ -306,6 +306,10 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
 
                     checksum_update_queue.put( checksum_msg)
 
+            file_payload = None
+            del data_received['data_block']['block_payload']
+
+        data_received = None
 
     worker_exiting_msg = {
         "msg_level"     : logging.DEBUG,
@@ -411,6 +415,11 @@ def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
                 # Write the block to all destinations
                 for curr_writer_queue in destination_writer_queues:
                     curr_writer_queue.put(data_block_msg)
+
+                # Drop the bytes as quickly as we can
+                data_block_payload_bytes = None
+                del data_block_msg['data_block']['block_payload']
+                data_block_msg = None
 
                 #print( "Wrote following block to all destinations:\n" + json.dumps(data_block_msg, indent=4, sort_keys=True, default=str))
 

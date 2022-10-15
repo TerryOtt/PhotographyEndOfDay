@@ -70,6 +70,9 @@ def checksum_coordinator(total_number_of_files_to_checksum,
             checksum_worker_processes[ worker_assignments[file_absolute_path] ]['communication_pipe'].send(
                 child_worker_msg
             )
+
+            # Explicitly drop handle to hopefully drop memory sooner
+            checksum_update_msg = None
         except queue.Empty:
             pass
 
@@ -81,6 +84,8 @@ def checksum_coordinator(total_number_of_files_to_checksum,
                 checksum_relative_path  = computed_checksum_msg['relative_path']
                 checksum_absolute_path  = computed_checksum_msg['absolute_path']
                 checksum_value          = computed_checksum_msg['computed_checksum']
+
+                computed_checksum_msg = None
 
                 if checksum_relative_path not in completed_checksums:
                     completed_checksums[checksum_relative_path] = {}
@@ -103,22 +108,6 @@ def checksum_coordinator(total_number_of_files_to_checksum,
 
         except queue.Empty:
             pass
-
-        # if 'data_block' not in checksum_update_msg or ('data_block' in checksum_update_msg and
-        #                                                checksum_update_msg['data_block']['block_byte_end'] ==
-        #                                                checksum_update_msg['file_info']['total_file_size'] ):
-        #     # Fake it out and claim we read the checksum for this file
-        #     checksums_computed += 1
-        #
-        #     faked_checksum_msg = {
-        #         "msg_level": logging.DEBUG,
-        #         "msg": f"Checksum coordinator faking checksum received for completed file \"{file_absolute_path}\"",
-        #     }
-        #     console_display_messages_queue.put(faked_checksum_msg)
-
-        # Drop reference to help garbage collection
-        checksum_update_msg = None
-
 
     #print( "Coordinator thinks all checksums are done")
 
@@ -207,6 +196,10 @@ def _checksum_worker(child_worker_index, files_to_checksum_pipe, checksums_compl
             else:
                 # Do partial update
                 hashlib_handles[file_absolute_path].update(checksum_work_msg['data_block']['block_payload'])
+
+                # Delete the payload as it's the big part of the message
+                del checksum_work_msg['data_block']['block_payload']
+
                 if checksum_work_msg['data_block']['block_byte_end'] == \
                         checksum_work_msg['file_info']['total_file_size']:
 
@@ -220,6 +213,14 @@ def _checksum_worker(child_worker_index, files_to_checksum_pipe, checksums_compl
                 }
 
                 checksums_completed_queue.put( computed_checksum_msg )
+
+                computed_checksum_msg = None
+
+                # We aren't going to use this hash handle again
+                del hashlib_handles[file_absolute_path]
+
+            checksum_work_msg = None
+            msg_from_pipe = None
 
         else:
             work_remains = False
