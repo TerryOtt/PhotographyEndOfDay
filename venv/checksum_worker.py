@@ -173,6 +173,8 @@ def _start_checksum_worker_processes( checksum_worker_processes ):
         checksum_worker_processes[i]['process_handle'].start()
 
 def _checksum_worker(child_worker_index, files_to_checksum_pipe, checksums_completed_queue):
+    hashlib_handles = {}
+
     work_remains = True
     while work_remains is True:
         msg_from_pipe = files_to_checksum_pipe.recv()
@@ -182,100 +184,42 @@ def _checksum_worker(child_worker_index, files_to_checksum_pipe, checksums_compl
             file_absolute_path = checksum_work_msg['file_info']['absolute_path']
             file_relative_path = checksum_work_msg['file_info']['relative_path']
 
+            # Do we have a hash handle for this file?
+            if file_absolute_path not in hashlib_handles:
+                hashlib_handles[ file_absolute_path ] = hashlib.sha3_512()
+
+
             # print( f"Worker {child_worker_index} got checksum data for " +
             #        json.dumps(checksum_work_msg['file_info'], indent=4, sort_keys=True))
 
             checksum_finished = False
             if 'data_block' not in checksum_work_msg:
+                # Do entire file checksum
+                with open( file_absolute_path, 'rb' ) as file_handle:
+                    file_bytes = file_handle.read()
+
+                hashlib_handles[ file_absolute_path ].update(file_bytes)
+
+                # Explicitly drop reference to the memory storing the full file contents so it gets garbage collected sooner
+                file_bytes = None
+
                 checksum_finished = True
             else:
+                # Do partial update
+                hashlib_handles[file_absolute_path].update(checksum_work_msg['data_block']['block_payload'])
                 if checksum_work_msg['data_block']['block_byte_end'] == \
                         checksum_work_msg['file_info']['total_file_size']:
 
                     checksum_finished = True
-                else:
-                    pass
-
 
             if checksum_finished is True:
-                # Fake out a checksum for now
                 computed_checksum_msg = {
                     'relative_path'     : file_relative_path,
                     'absolute_path'     : file_absolute_path,
-                    'computed_checksum' : '00000000',
+                    'computed_checksum' : hashlib_handles[ file_absolute_path].hexdigest(),
                 }
 
                 checksums_completed_queue.put( computed_checksum_msg )
 
         else:
             work_remains = False
-
-
-    # if 'data_block' not in checksum_update_msg:
-    #
-    #      if file_relative_path not in completed_checksums:
-    #          completed_checksums[file_relative_path] = {}
-    #
-    #      # TODO: remove this, this is just debugging until we have real workers
-    #      computed_hash = "00000000"
-    #      if computed_hash not in completed_checksums[file_relative_path]:
-    #          completed_checksums[file_relative_path][computed_hash] = []
-    #
-    #      completed_checksums[file_relative_path][computed_hash].append(file_absolute_path)
-    #
-    #      checksums_computed += 1
-    #
-    #  # Got a partial update
-    #  else:
-    #
-    #      # Was this block the final block in this file?
-    #      if checksum_update_msg['data_block']['block_byte_end'] == checksum_update_msg['file_info']['total_file_size']:
-    #          if file_relative_path not in completed_checksums:
-    #              completed_checksums[file_relative_path] = {}
-    #
-    #          # TODO: remove this, this is just debugging until we have real workers
-    #          computed_hash = "00000000"
-    #          if computed_hash not in completed_checksums[file_relative_path]:
-    #              completed_checksums[file_relative_path][computed_hash] = []
-    #
-    #          completed_checksums[file_relative_path][computed_hash].append(file_absolute_path)
-    #
-    #          checksums_computed += 1
-
-
-    #     hash_handles[ file_absolute_path ] = hashlib.sha3_512()
-    #
-    # # Do entire file checksum
-    # if 'data_block' not in checksum_update_msg:
-    #     with open( file_absolute_path, 'rb' ) as file_handle:
-    #         file_bytes = file_handle.read()
-    #
-    #     hash_handles[ file_absolute_path ].update(file_bytes)
-    #
-    #     # Explicitly drop reference to the memory storing the full file contents so it gets garbage collected sooner
-    #     file_bytes = None
-    #
-    #     # We have fully processed this file, so add it to completed checksums
-    #     if file_relative_path not in completed_checksums:
-    #         completed_checksums[file_relative_path] = {}
-    #     computed_hash = hash_handles[file_absolute_path].hexdigest()
-    #     if computed_hash not in completed_checksums[file_relative_path]:
-    #         completed_checksums[file_relative_path][computed_hash] = []
-    #
-    #     completed_checksums[file_relative_path][computed_hash].append( file_absolute_path )
-    #     checksums_computed += 1
-    #
-    # # Update checksum based on block
-    # else:
-    #     hash_handles[file_absolute_path].update( checksum_update_msg['data_block']['block_payload'] )
-    #
-    #     # Was this block the final block in this file?
-    #     if checksum_update_msg['data_block']['block_byte_end'] == checksum_update_msg['file_info']['total_file_size']:
-    #         if file_relative_path not in completed_checksums:
-    #             completed_checksums[file_relative_path] = {}
-    #         computed_hash = hash_handles[file_absolute_path].hexdigest()
-    #         if computed_hash not in completed_checksums[file_relative_path]:
-    #             completed_checksums[file_relative_path][computed_hash] = []
-    #
-    #         completed_checksums[file_relative_path][computed_hash].append(file_absolute_path)
-    #         checksums_computed += 1
