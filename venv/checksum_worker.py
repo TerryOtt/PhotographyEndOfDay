@@ -3,6 +3,7 @@ import logging
 import json
 import multiprocessing
 import queue
+import time
 
 
 def checksum_coordinator(total_number_of_files_to_checksum,
@@ -28,7 +29,15 @@ def checksum_coordinator(total_number_of_files_to_checksum,
                                                                    checksums_completed_queue )
     _start_checksum_worker_processes( checksum_worker_processes )
 
+    checksum_children_started_msg = {
+        "msg_level" : logging.INFO,
+        "msg"       : f"Checksum coordinator launched {len(checksum_worker_processes)} checksum processes",
+    }
+    console_display_messages_queue.put( checksum_children_started_msg )
+
     checksum_queue_blocking = False
+
+    start_time = time.perf_counter()
 
     while checksums_computed < total_number_of_files_to_checksum:
         # See if any new work to dole out
@@ -109,16 +118,17 @@ def checksum_coordinator(total_number_of_files_to_checksum,
         except queue.Empty:
             pass
 
+    end_time = time.perf_counter()
+    checksum_operation_time_seconds = end_time - start_time
+    checksum_file_velocity = total_number_of_files_to_checksum // checksum_operation_time_seconds
+
+    print( f"\nChecksums completed for {total_number_of_files_to_checksum:,} files in " +
+               f"{checksum_operation_time_seconds:.03f} seconds ({checksum_file_velocity:,} files/sec)" )
+
     #print( "Coordinator thinks all checksums are done")
 
     # Blast the list of computed checksums back over the pipe so the checksum manager can read it and act
     all_checksums_computed_write_connection.send( completed_checksums )
-
-    coordinator_finished_msg = {
-        "msg_level": logging.INFO,
-        "msg": f"Checksum coordinator saw all {total_number_of_files_to_checksum} expected files",
-    }
-    console_display_messages_queue.put(coordinator_finished_msg)
 
     # Now send the sentinel value to all children that they can terminate cleanly
     terminate_msg = {
@@ -132,11 +142,11 @@ def checksum_coordinator(total_number_of_files_to_checksum,
         curr_process_to_join = checksum_worker_processes.pop()
         curr_process_to_join['process_handle'].join()
 
-    all_children_rejoined_msg = {
-        "msg_level": logging.INFO,
-        "msg": f"Checksum coordinator had all child checksum worker processes rejoin, exiting cleanly",
-    }
-    console_display_messages_queue.put(all_children_rejoined_msg)
+    # all_children_rejoined_msg = {
+    #     "msg_level": logging.INFO,
+    #     "msg": f"Checksum coordinator had all child checksum worker processes rejoin, exiting cleanly",
+    # }
+    # console_display_messages_queue.put(all_children_rejoined_msg)
 
 
 def _create_checksum_worker_processes( number_of_worker_processes_allowed, checksums_completed_queue ):
@@ -154,6 +164,7 @@ def _create_checksum_worker_processes( number_of_worker_processes_allowed, check
                                                                     checksums_completed_queue) ),
             'child_queue'    : child_worker_queue,
         }
+
         checksum_worker_info.append( curr_worker_info )
 
     return checksum_worker_info
