@@ -8,7 +8,8 @@ class ChecksumManager:
     def __init__(self, total_number_of_files_to_checksum, console_display_messages_queue,
                  number_of_worker_processes_allowed ):
 
-        self.checksum_update_queue = multiprocessing.Queue()
+        max_size_update_queue = 1000
+        self.checksum_update_queue = multiprocessing.Queue( max_size_update_queue )
         (self.checksums_computed_pipe_read_connection,
          self.checksums_computed_pipe_write_connection) = multiprocessing.Pipe(duplex=False)
         self.console_display_messages_queue = console_display_messages_queue

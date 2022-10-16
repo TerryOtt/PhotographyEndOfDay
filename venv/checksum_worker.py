@@ -67,7 +67,7 @@ def checksum_coordinator(total_number_of_files_to_checksum,
             child_worker_msg = {
                 'checksum_work': checksum_update_msg
             }
-            checksum_worker_processes[ worker_assignments[file_absolute_path] ]['communication_pipe'].send(
+            checksum_worker_processes[ worker_assignments[file_absolute_path] ]['child_queue'].put(
                 child_worker_msg
             )
 
@@ -125,7 +125,7 @@ def checksum_coordinator(total_number_of_files_to_checksum,
         'done_writing': True,
     }
     for curr_child_entry in checksum_worker_processes:
-        curr_child_entry['communication_pipe'].send( terminate_msg )
+        curr_child_entry['child_queue'].put( terminate_msg )
 
     # Land all child worker processes now that they'll be coming home
     while checksum_worker_processes:
@@ -142,15 +142,17 @@ def checksum_coordinator(total_number_of_files_to_checksum,
 def _create_checksum_worker_processes( number_of_worker_processes_allowed, checksums_completed_queue ):
     checksum_worker_info = []
 
-    pipe_duplex_setting = False
+    # Dynamically compute this based on queue size passed in
+    max_child_queue_length = 1000 // number_of_worker_processes_allowed
+
     for curr_checksum_worker_index in range(number_of_worker_processes_allowed):
-        child_worker_pipe = multiprocessing.Pipe(pipe_duplex_setting)
+        child_worker_queue = multiprocessing.Queue( max_child_queue_length )
         curr_worker_info = {
             'process_handle'        : multiprocessing.Process(target=_checksum_worker,
                                                               args=(curr_checksum_worker_index,
-                                                                    child_worker_pipe[0],
+                                                                    child_worker_queue,
                                                                     checksums_completed_queue) ),
-            'communication_pipe'    : child_worker_pipe[1],
+            'child_queue'    : child_worker_queue,
         }
         checksum_worker_info.append( curr_worker_info )
 
@@ -161,15 +163,15 @@ def _start_checksum_worker_processes( checksum_worker_processes ):
     for i in range(len(checksum_worker_processes)):
         checksum_worker_processes[i]['process_handle'].start()
 
-def _checksum_worker(child_worker_index, files_to_checksum_pipe, checksums_completed_queue):
+def _checksum_worker(child_worker_index, files_to_checksum_queue, checksums_completed_queue):
     hashlib_handles = {}
 
     work_remains = True
     while work_remains is True:
-        msg_from_pipe = files_to_checksum_pipe.recv()
+        msg_from_queue = files_to_checksum_queue.get()
 
-        if 'done_writing' not in msg_from_pipe:
-            checksum_work_msg = msg_from_pipe['checksum_work']
+        if 'done_writing' not in msg_from_queue:
+            checksum_work_msg = msg_from_queue['checksum_work']
             file_absolute_path = checksum_work_msg['file_info']['absolute_path']
             file_relative_path = checksum_work_msg['file_info']['relative_path']
 
@@ -220,7 +222,7 @@ def _checksum_worker(child_worker_index, files_to_checksum_pipe, checksums_compl
                 del hashlib_handles[file_absolute_path]
 
             checksum_work_msg = None
-            msg_from_pipe = None
+            msg_from_queue = None
 
         else:
             work_remains = False
