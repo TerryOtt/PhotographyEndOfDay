@@ -13,11 +13,8 @@ curr_processes_running = 1
 
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="End of day script to create validated travel copies of all pics")
+
     arg_parser.add_argument("--debug", help="Lower logging level from INFO to DEBUG", action="store_true")
-    arg_parser.add_argument("--logfile",
-                            help="file to store logs to (default: stdout)" )
-    arg_parser.add_argument("--singlethreaded", help="Disable multi-threading, do everything single threaded",
-                            action="store_true")
 
     # The "Action append" lets the parameter be specified multiple times, but it's still optional so may exist no times
     arg_parser.add_argument("--sourcedir",
@@ -30,12 +27,19 @@ def _parse_args():
                             type=int,
                             default=0)
 
-    max_processes_default = multiprocessing.cpu_count() - 1
-    arg_parser.add_argument("--max_processes",
-                            help="Maximum number of processes running at one time (used to limit worker processes)" +
-                                f" (default on this computer: {max_processes_default})",
-                            default=max_processes_default,
+    num_checksum_processes_default = multiprocessing.cpu_count() - 1
+    arg_parser.add_argument("--checksum_processes",
+                            help="Number of checksum processes to launch" +
+                                f" (default on this computer: {num_checksum_processes_default})",
+                            default=num_checksum_processes_default,
                             type=int )
+
+    checksum_queue_length_default = 10000
+    arg_parser.add_argument("--checksum_queue_length",
+                            help="Length of the checksum queue " +
+                                 f" (default on this computer: {checksum_queue_length_default})",
+                            default=checksum_queue_length_default,
+                            type=int)
 
     known_raw_file_extensions = ['NEF', 'CR3']
     arg_parser.add_argument("raw_file_fileext",
@@ -84,13 +88,19 @@ def _enumerate_source_images(program_options):
     print( "\nEnumerating source images")
 
     source_file_lists = {}
-    total_file_bytes = 0
 
     exiftool_tag_name = "EXIF:DateTimeOriginal"
 
     # Create a dictionary that maps all absolute file paths to the relative one they have in common
     for curr_sourcedir in program_options['sourcedirs']:
         source_file_lists[curr_sourcedir] = _scan_source_dir_for_images(curr_sourcedir, program_options )
+        print( f"\t\tFound {len(source_file_lists[curr_sourcedir])} \".{program_options['file_extension']}\" files" )
+
+    return source_file_lists
+
+
+def _extract_exif_timestamps( program_options, source_file_lists ):
+    print("\nExtracting EXIF timestamps from all source images")
 
     # Populate EXIF timestamps for all images
     raw_file_list = []
@@ -104,13 +114,9 @@ def _enumerate_source_images(program_options):
 
     #print( f"Reverse map created:\n{json.dumps(reverse_map, indent=4, sort_keys=True)}")
 
-    raw_file_list.sort()
-
     with exiftool.ExifToolHelper() as exiftool_handle:
         exiftool_tag_name = "EXIF:DateTimeOriginal"
-        file_timestamps = exiftool_handle.get_tags( raw_file_list, tags = [ exiftool_tag_name] )
-
-    #print( f"Timestamp results:\n{json.dumps(file_timestamps, indent=4, sort_keys=True)}")
+        file_timestamps = exiftool_handle.get_tags( raw_file_list, tags = [ exiftool_tag_name, ] )
 
     for curr_timestamp_entry in file_timestamps:
         file_datetime_no_tz = datetime.datetime.strptime(curr_timestamp_entry[exiftool_tag_name], "%Y:%m:%d %H:%M:%S")
@@ -124,6 +130,15 @@ def _enumerate_source_images(program_options):
         reverse_map_key = curr_timestamp_entry['SourceFile'].replace( '/', os.sep)
         reverse_map[ reverse_map_key ]['timestamp'] = file_datetime_utc
 
+    print( f"\tParsed EXIF timestamps from {len(file_timestamps)} \".{program_options['file_extension']}\" files")
+
+    # Nothing to return -- it's stored in the source file list info
+
+
+def _validate_sourcedir_lists_match( program_options, source_file_lists ):
+
+    print("\nValidating all sourcedir file lists are identical")
+
     # Make sure all file lists came out identical
     for curr_sourcedir in program_options['sourcedirs'][2:]:
         if source_file_lists[program_options['sourcedirs'][0]] != source_file_lists[curr_sourcedir]:
@@ -136,9 +151,9 @@ def _enumerate_source_images(program_options):
 
     #total_file_count = 9876
 
-
     # Create return list (only need relative paths)
     file_dict = {}
+    total_file_bytes = 0
     for curr_file_entry in source_file_lists[program_options['sourcedirs'][0]]:
         file_dict[ curr_file_entry['file_path']['relative']] = {
             'filesize_bytes'    : curr_file_entry['filesize_bytes'],
@@ -146,7 +161,7 @@ def _enumerate_source_images(program_options):
         }
         total_file_bytes += curr_file_entry['filesize_bytes']
 
-    bytes_in_gb = 1073741824.0
+    bytes_in_gb = 1024.0 * 1024.0 * 1024.0
     total_file_gb = total_file_bytes / bytes_in_gb
 
     print ( f"\tFound {total_file_count:,} \".{program_options['file_extension']}\" files totalling " +
@@ -471,10 +486,7 @@ def _main():
     else:
         log_level = logging.DEBUG
 
-    if args.logfile:
-        logging.basicConfig( filename=args.logfile, level=log_level )
-    else:
-        logging.basicConfig(level=log_level)
+    logging.basicConfig(level=log_level)
 
     if args.sourcedir:
         program_options['sourcedirs'] = sorted(args.sourcedir)
@@ -484,13 +496,18 @@ def _main():
     program_options['file_extension'] = args.raw_file_fileext.lower()
     program_options['timestamp_utc_offset_hours'] = args.timestamp_utc_offset_hours
     program_options['destination_folders'] = args.travel_storage_media_folder
-    program_options['max_processes'] = args.max_processes
+    program_options['checksum_processes'] = args.checksum_processes
+    program_options['checksum_queue_length'] = args.checksum_queue_length
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
-    source_image_info = _enumerate_source_images(program_options)
+    source_file_lists = _enumerate_source_images(program_options)
     #print( "\nSource file info:\n" + json.dumps(source_image_info['source_file_dict'],
     #                                                             indent=4, sort_keys=True, default=str) )
+
+    _extract_exif_timestamps( program_options, source_file_lists )
+
+    source_image_info = _validate_sourcedir_lists_match(program_options, source_file_lists )
 
     # Determine unique filenames
     _set_destination_filenames( program_options, source_image_info['source_file_dict'] )
@@ -498,14 +515,12 @@ def _main():
     # Create queue that all children use to send messages for display back up to parent
     display_console_messages_queue = multiprocessing.Queue()
 
-    number_of_checksum_workers_allowed = (program_options['max_processes'] -
-        len(program_options['sourcedirs']) - len(program_options['destination_folders']))
-
     checksum_manager = checksum_mgr.ChecksumManager(len(source_image_info['source_file_dict']) *
                                                     (len(program_options['sourcedirs']) +
                                                      len(program_options['destination_folders'])),
                                                     display_console_messages_queue,
-                                                    number_of_checksum_workers_allowed)
+                                                    program_options['checksum_queue_length'],
+                                                    program_options['checksum_processes'])
 
     # Launch destination writers
     destination_writers = _launch_destination_writers( program_options, display_console_messages_queue,
@@ -526,7 +541,7 @@ def _main():
             process_started_msg = display_console_messages_queue.get(blocking_read, read_timeout_seconds)
             print( f"Parent got message to display: \"{process_started_msg['msg']}\"")
     except queue.Empty:
-        print( f"\nParent has emptied the console message display queue, breaking out of loop\n")
+        pass
 
     # Now let's wait for checksum data to come in
     checksum_manager.validate_all_checksums_match()
