@@ -120,10 +120,10 @@ def checksum_coordinator(total_number_of_files_to_checksum,
 
     end_time = time.perf_counter()
     checksum_operation_time_seconds = end_time - start_time
-    checksum_file_velocity = total_number_of_files_to_checksum // checksum_operation_time_seconds
+    checksum_file_velocity = total_number_of_files_to_checksum / checksum_operation_time_seconds
 
     print( f"\nChecksums completed for {total_number_of_files_to_checksum:,} files in " +
-               f"{checksum_operation_time_seconds:.03f} seconds ({checksum_file_velocity:,} files/sec)" )
+               f"{checksum_operation_time_seconds:.03f} seconds ({checksum_file_velocity:.02f} files/sec)" )
 
     #print( "Coordinator thinks all checksums are done")
 
