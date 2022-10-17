@@ -8,8 +8,8 @@ import sys
 import exiftool             # Requires pip3 install pyexiftool >= 0.5
 import datetime
 import checksum_mgr
+import random
 
-curr_processes_running = 1
 
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="End of day script to create validated travel copies of all pics")
@@ -109,31 +109,97 @@ def _extract_exif_timestamps( program_options, source_file_lists ):
         for (index, curr_file_entry) in enumerate(source_file_lists[curr_sourcedir]):
             raw_file_list.append(curr_file_entry['file_path']['absolute'])
 
-            # Store a reference into the source array keyed by absolute filename so we can do a quick update with the timestamp
+            # Store a reference into the source array keyed by absolute filename so we can do an O(1) lookup
+            #   when we need to update with the timestamp
             reverse_map[ curr_file_entry['file_path']['absolute'] ] = source_file_lists[curr_sourcedir][index]
 
     #print( f"Reverse map created:\n{json.dumps(reverse_map, indent=4, sort_keys=True)}")
 
+    # Randomly shuffle the file list so that we send our queries across a fairly even distribution of sourcedirs
+    #   e.g., don't send all drive 1 entries then drive 2 entries, this keeps the load even over all sourcedirs
+    random.shuffle(raw_file_list)
+
+    # Two queues, one to send files to process to workers, one for workers to send us timestamps back
+    files_to_timestamp_queue = multiprocessing.Queue()
+    timestamped_files_queue = multiprocessing.Queue()
+
+    # Event to tell everyone when all the work is done
+    all_hashes_read = multiprocessing.Event()
+
+    num_exiftool_workers = multiprocessing.cpu_count() - 1
+    exiftool_worker_handles = []
+    for i in range( num_exiftool_workers ):
+        worker_name = f"exiftool_worker_{i+1}"
+        curr_handle = multiprocessing.Process(target=_exiftool_worker,
+                                              args=(worker_name, files_to_timestamp_queue, timestamped_files_queue,
+                                                    all_hashes_read, program_options['timestamp_utc_offset_hours']) )
+        exiftool_worker_handles.append(curr_handle)
+        curr_handle.start()
+
+    timestamps_received = 0
+    timestamps_expected = len(raw_file_list)
+    curr_file_index_to_send = 0
+
+    while timestamps_received < timestamps_expected:
+        # Send a file to timestamp
+        if curr_file_index_to_send < timestamps_expected:
+            files_to_timestamp_queue.put( raw_file_list[curr_file_index_to_send] )
+            curr_file_index_to_send += 1
+
+        # Read extracted timestamps until queue is empty
+        try:
+            extracted_timestamp_info = timestamped_files_queue.get_nowait()
+            timestamps_received += 1
+
+            reverse_map[ extracted_timestamp_info['absolute_path'] ]['timestamp'] = extracted_timestamp_info['timestamp']
+
+        except queue.Empty:
+            # No worries, just loop back and try it all again
+            pass
+
+    # Let the children know we're all done
+    all_hashes_read.set()
+
+    # Land all the worker processes and clean up their resources
+    while exiftool_worker_handles:
+        curr_handle = exiftool_worker_handles.pop()
+        curr_handle.join()
+        curr_handle.close()
+
+    # Debug print one entry to make sure timestamp looks sane
+    print( json.dumps( reverse_map[ raw_file_list[0] ], indent=4, sort_keys=True, default=str) )
+
+    print( f"\tParsed EXIF timestamps from {timestamps_expected} \".{program_options['file_extension']}\" files")
+
+
+def _exiftool_worker( worker_name, files_to_timestamp_queue, timestamped_files_queue, all_hashes_read,
+                      timestamp_utc_offset_hours ):
+
+    exiftool_tag_name = "EXIF:DateTimeOriginal"
     with exiftool.ExifToolHelper() as exiftool_handle:
-        exiftool_tag_name = "EXIF:DateTimeOriginal"
-        file_timestamps = exiftool_handle.get_tags( raw_file_list, tags = [ exiftool_tag_name, ] )
+        while all_hashes_read.is_set() is False:
+            try:
+                file_to_timestamp = files_to_timestamp_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
 
-    for curr_timestamp_entry in file_timestamps:
-        file_datetime_no_tz = datetime.datetime.strptime(curr_timestamp_entry[exiftool_tag_name], "%Y:%m:%d %H:%M:%S")
-        # Do hour shift from timezone-unaware EXIF datetime to UTC (still no TZ, just shifting hours)
-        shifted_datetime_no_tz = file_datetime_no_tz + datetime.timedelta(
-            hours=-(program_options['timestamp_utc_offset_hours']))
-        # Create TZ-aware datetime, as one should basically always strive to use
-        file_datetime_utc = shifted_datetime_no_tz.replace(tzinfo=datetime.timezone.utc)
+            file_timestamps = exiftool_handle.get_tags( file_to_timestamp, tags = exiftool_tag_name )
+            curr_timestamp_entry = file_timestamps[0]
 
-        # Convert the SourceFile tag to be windows-friendly (backslashes)
-        reverse_map_key = curr_timestamp_entry['SourceFile'].replace( '/', os.sep)
-        reverse_map[ reverse_map_key ]['timestamp'] = file_datetime_utc
+            file_datetime_no_tz = datetime.datetime.strptime(curr_timestamp_entry[exiftool_tag_name], "%Y:%m:%d %H:%M:%S")
+            # Do hour shift from timezone-unaware EXIF datetime to UTC (still no TZ, just shifting hours)
+            shifted_datetime_no_tz = file_datetime_no_tz + datetime.timedelta(
+                hours=-timestamp_utc_offset_hours )
+            # Create TZ-aware datetime, as one should basically always strive to use
+            file_datetime_utc = shifted_datetime_no_tz.replace(tzinfo=datetime.timezone.utc)
 
-    print( f"\tParsed EXIF timestamps from {len(file_timestamps)} \".{program_options['file_extension']}\" files")
+            # Send this info back home
+            extracted_timestamp = {
+                'absolute_path' : file_to_timestamp,
+                'timestamp'     : file_datetime_utc,
+            }
 
-    # Nothing to return -- it's stored in the source file list info
-
+            timestamped_files_queue.put( extracted_timestamp )
 
 def _validate_sourcedir_lists_match( program_options, source_file_lists ):
 
@@ -337,8 +403,6 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
 def _launch_destination_writers(program_options, display_console_messages_queue, checksum_update_queue ):
     destination_writer_queues = _create_destination_writer_queues(program_options)
 
-    global curr_processes_running
-
     writer_process_handles = []
 
     number_of_sourcedirs = len(program_options['sourcedirs'])
@@ -354,7 +418,6 @@ def _launch_destination_writers(program_options, display_console_messages_queue,
 
         writer_process_handles.append( curr_handle )
         curr_handle.start()
-        curr_processes_running += 1
 
     return_dict = {
         "writer_queues"             : destination_writer_queues,
@@ -460,8 +523,6 @@ def _launch_sourcedir_readers( program_options, source_image_info, display_conso
                                destination_writers,
                                checksum_update_queue ):
 
-    global curr_processes_running
-
     reader_process_handles = []
     #print( f"Destination writers:\n{json.dumps(destination_writers, indent=4, sort_keys=True, default=str)}")
 
@@ -473,7 +534,6 @@ def _launch_sourcedir_readers( program_options, source_image_info, display_conso
                                                      checksum_update_queue) )
         reader_process_handles.append( curr_handle )
         curr_handle.start()
-        curr_processes_running += 1
 
     return reader_process_handles
 
