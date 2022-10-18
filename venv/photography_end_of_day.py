@@ -92,7 +92,7 @@ def _enumerate_source_images(program_options):
     # Create a dictionary that maps all absolute file paths to the relative one they have in common
     for curr_sourcedir in program_options['sourcedirs']:
         source_file_lists[curr_sourcedir] = _scan_source_dir_for_images(curr_sourcedir, program_options )
-        print( f"\t\tFound {len(source_file_lists[curr_sourcedir])} \".{program_options['file_extension']}\" files" )
+        print( f"\tFound {len(source_file_lists[curr_sourcedir])} \".{program_options['file_extension']}\" files" )
 
     return source_file_lists
 
@@ -605,35 +605,41 @@ def _main():
                                                    destination_writers,
                                                    checksum_manager.checksum_update_queue)
 
+    print( "\nStarting combination file copy/checksum computation operations")
+
     # Read out all messages from the display queue
     blocking_read = True
-    read_timeout_seconds = 2.0
+    read_timeout_seconds = 0.05
     try:
-        print( "\n\n")
+        #print( "\n\n")
         while True:
             process_started_msg = display_console_messages_queue.get(blocking_read, read_timeout_seconds)
-            print( f"Parent got message to display: \"{process_started_msg['msg']}\"")
+
+            # TODO: maybe move this to its own process and do something useful, but for now, politely ignore
+            #print( f"Parent got message to display: \"{process_started_msg['msg']}\"")
     except queue.Empty:
         pass
 
     # Now let's wait for checksum data to come in
-    checksum_manager.validate_all_checksums_match()
+    number_unique_files = len(source_image_info['source_file_dict'])
+    number_copies_of_unique_files = len(program_options['sourcedirs']) + len(program_options['destination_folders'])
+    checksum_manager.validate_all_checksums_match( number_unique_files, number_copies_of_unique_files )
 
     # Now clean up the reader/writer processes
 
     while len(sourcedir_readers) > 0:
         curr_reader_handle = sourcedir_readers.pop()
-        print( "Parent waiting for sourcedir reader child process to rejoin")
+        #print( "Parent waiting for sourcedir reader child process to rejoin")
         curr_reader_handle.join()
-        print( "Parent had sourcedir reader child process rejoin")
+        #print( "Parent had sourcedir reader child process rejoin")
 
     while len(destination_writers['writer_process_handles']) > 0:
         curr_handle = destination_writers['writer_process_handles'].pop()
-        print( "Parent waiting for destination writer child process to rejoin" )
+        #print( "Parent waiting for destination writer child process to rejoin" )
         curr_handle.join()
-        print( "Parent had destination writer child process rejoin")
+        #print( "Parent had destination writer child process rejoin")
 
-    print( "parent terminating cleanly" )
+    #print( "parent terminating cleanly" )
 
 if __name__ == "__main__":
     _main()
