@@ -10,7 +10,6 @@ import datetime
 import checksum_mgr
 import random
 
-
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="End of day script to create validated travel copies of all pics")
 
@@ -27,14 +26,15 @@ def _parse_args():
                             type=int,
                             default=0)
 
-    num_checksum_processes_default = multiprocessing.cpu_count() - 1
+    #num_checksum_processes_default = multiprocessing.cpu_count() - 1
+    num_checksum_processes_default = 6      # Determined experimentally
     arg_parser.add_argument("--checksum_processes",
                             help="Number of checksum processes to launch" +
                                 f" (default on this computer: {num_checksum_processes_default})",
                             default=num_checksum_processes_default,
                             type=int )
 
-    checksum_queue_length_default = 10000
+    checksum_queue_length_default = 9500            # Determined experimentally
     arg_parser.add_argument("--checksum_queue_length",
                             help="Length of the checksum queue " +
                                  f" (default on this computer: {checksum_queue_length_default})",
@@ -88,8 +88,6 @@ def _enumerate_source_images(program_options):
     print( "\nEnumerating source images")
 
     source_file_lists = {}
-
-    exiftool_tag_name = "EXIF:DateTimeOriginal"
 
     # Create a dictionary that maps all absolute file paths to the relative one they have in common
     for curr_sourcedir in program_options['sourcedirs']:
@@ -167,7 +165,7 @@ def _extract_exif_timestamps( program_options, source_file_lists ):
         curr_handle.close()
 
     # Debug print one entry to make sure timestamp looks sane
-    print( json.dumps( reverse_map[ raw_file_list[0] ], indent=4, sort_keys=True, default=str) )
+    #print( json.dumps( reverse_map[ raw_file_list[0] ], indent=4, sort_keys=True, default=str) )
 
     print( f"\tParsed EXIF timestamps from {timestamps_expected} \".{program_options['file_extension']}\" files")
 
@@ -351,6 +349,11 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
                 write_block_to_disk = False
 
             if write_block_to_disk:
+
+                #print( f"\n *** Destination absolute path created by joining folder {destination_folder} and path {relative_path}")
+
+                destination_absolute_path = os.path.join(destination_folder, relative_path)
+
                 # Is this the first data block for the file?
                 if byte_start == 1:
                     # Create missing directories along the path, if any
@@ -360,13 +363,23 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
 
                     # Open for write (create) in binary mode
                     open_flags = "wb"
+
+                    # Sanity check because some weird shit is happening
+                    assert  os.path.isfile(destination_absolute_path) is False, \
+                            f"Going to try to write to {destination_dir_absolute_path} for the first time, but the file existed"
                 else:
                     # Open for append in binary mode
                     open_flags = "ab"
 
-                destination_absolute_path = os.path.join(destination_folder, relative_path)
-                with open( destination_absolute_path, open_flags ) as file_handle:
-                    file_handle.write( file_payload )
+                    assert os.path.isfile(destination_absolute_path), \
+                            f"Was going to append to {destination_dir_absolute_path} but the file doesn't exist"
+
+                try:
+                    with open( destination_absolute_path, open_flags ) as file_handle:
+                        file_handle.write( file_payload )
+                except:
+                    print( f"Error hit when opening/writing {destination_absolute_path} with flags {open_flags}")
+                    break
 
                 # display_message = f"Destination writer for {destination_folder} got data block from {sourcedir} for {relative_path}, starting at byte {byte_start}, len={payload_len}, ending byte={byte_end}, total file size={total_file_size}"
                 # writing_data_msg = {
