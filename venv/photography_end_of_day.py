@@ -631,12 +631,14 @@ def _main():
         curr_reader_handle = sourcedir_readers.pop()
         #print( "Parent waiting for sourcedir reader child process to rejoin")
         curr_reader_handle.join()
+        curr_reader_handle.close()
         #print( "Parent had sourcedir reader child process rejoin")
 
     while len(destination_writers['writer_process_handles']) > 0:
         curr_handle = destination_writers['writer_process_handles'].pop()
         #print( "Parent waiting for destination writer child process to rejoin" )
         curr_handle.join()
+        curr_handle.close()
         #print( "Parent had destination writer child process rejoin")
 
     #print( "parent terminating cleanly" )

@@ -141,6 +141,7 @@ def checksum_coordinator(total_number_of_files_to_checksum,
     while checksum_worker_processes:
         curr_process_to_join = checksum_worker_processes.pop()
         curr_process_to_join['process_handle'].join()
+        curr_process_to_join['process_handle'].close()
 
     # all_children_rejoined_msg = {
     #     "msg_level": logging.INFO,

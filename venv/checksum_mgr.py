@@ -73,6 +73,7 @@ class ChecksumManager:
             print( "\tSome validation tests failed")
 
         self.coordinator_process_handle.join()
+        self.coordinator_process_handle.close()
         #print( "\nChecksum mgr had checksum coordinator process rejoin cleanly")
 
 
