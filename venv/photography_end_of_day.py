@@ -365,14 +365,14 @@ def _write_to_destination_folder_worker( pipe_read_connection, destination_folde
                     open_flags = "wb"
 
                     # Sanity check because some weird shit is happening
-                    assert  os.path.isfile(destination_absolute_path) is False, \
-                            f"Going to try to write to {destination_dir_absolute_path} for the first time, but the file existed"
+                    assert os.path.isfile(destination_absolute_path) is False, \
+                            f"Going to try to write to {destination_absolute_path} for the first time, but the file existed"
                 else:
                     # Open for append in binary mode
                     open_flags = "ab"
 
                     assert os.path.isfile(destination_absolute_path), \
-                            f"Was going to append to {destination_dir_absolute_path} but the file doesn't exist"
+                            f"Was going to append to {destination_absolute_path} but the file doesn't exist"
 
                 try:
                     with open( destination_absolute_path, open_flags ) as file_handle:
