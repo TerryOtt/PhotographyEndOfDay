@@ -34,7 +34,7 @@ class PerformanceTimer:
                 if len(entry['label']) > longest_label_len:
                     longest_label_len = len(entry['label'])
 
-            print("\nPerformance data:\n")
+            print("\nProfiling stats:\n")
 
             for curr_entry in self._perf_data['entries']:
                 percentage_time = (curr_entry['value'] / self._perf_data['total']) * 100.0

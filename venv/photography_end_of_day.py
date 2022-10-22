@@ -10,6 +10,7 @@ import datetime
 import checksum_mgr
 import random
 import time
+import performance_timer
 
 
 def _parse_args():
@@ -611,6 +612,29 @@ def _launch_sourcedir_readers( program_options, source_image_info, display_conso
 
     return reader_process_handles
 
+
+def _print_io_stats ( source_image_info, time_copy_checksum_seconds, number_of_copies_read,
+                      number_of_copies_written ):
+
+    bytes_in_gb = 1024.0 * 1024.0 * 1024.0
+    gb_per_copy = source_image_info['total_file_bytes'] / bytes_in_gb
+
+    gb_read = gb_per_copy * number_of_copies_read
+    read_speed = gb_read / time_copy_checksum_seconds
+
+    gb_written = gb_per_copy * number_of_copies_written
+    write_speed = gb_written / time_copy_checksum_seconds
+
+    total_gb = gb_read + gb_written
+    total_speed = total_gb / time_copy_checksum_seconds
+
+    print( "\nIO stats:")
+
+    #print( f"\tGB per copy: {gb_per_copy:,.02f}")
+    print( f"\t   Total RAW picture data read: {gb_read:8,.02f} GB ({read_speed:4.02f} GB/s)")
+    print( f"\tTotal RAW picture data written: {gb_written:8,.02f} GB ({write_speed:4.02f} GB/s)")
+    print( f"\t                      Total IO: {total_gb:8,.02f} GB ({total_speed:4.02f} GB/s)")
+
 def _main():
     args = _parse_args()
     program_options = {}
@@ -638,20 +662,33 @@ def _main():
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
+    perftimer = performance_timer.PerformanceTimer()
+    time_start = time.perf_counter()
     source_file_lists = _enumerate_source_images(program_options)
+    time_end = time.perf_counter()
+    perftimer.add_perf_timing( "Enumerate source images", time_end - time_start)
     #print( "\nSource file info:\n" + json.dumps(source_image_info['source_file_dict'],
     #                                                             indent=4, sort_keys=True, default=str) )
 
+    time_start = time.perf_counter()
     _extract_exif_timestamps( source_file_lists, program_options )
+    time_end = time.perf_counter()
+    perftimer.add_perf_timing( "Extract EXIF timestamps", time_end - time_start)
 
-    return
-
+    time_start = time.perf_counter()
     source_image_info = _validate_sourcedir_lists_match(program_options, source_file_lists )
+    time_end = time.perf_counter()
+    perftimer.add_perf_timing( "Validate all sourcedir lists match", time_end - time_start)
+
 
     #print( "Source image info:\n" + json.dumps(source_image_info, indent=4, sort_keys=True, default=str))
 
     # Determine unique filenames
+    time_start = time.perf_counter()
     _set_destination_filenames( program_options, source_image_info['source_file_dict'] )
+    time_end = time.perf_counter()
+    perftimer.add_perf_timing( "Determine unique destination filenames", time_end - time_start)
+
 
     # Create queue that all children use to send messages for display back up to parent
     display_console_messages_queue = multiprocessing.Queue()
@@ -662,6 +699,8 @@ def _main():
                                                     display_console_messages_queue,
                                                     program_options['checksum_queue_length'],
                                                     program_options['checksum_processes'])
+
+    time_start = time.perf_counter()
 
     # Launch destination writers
     destination_writers = _launch_destination_writers( program_options, display_console_messages_queue,
@@ -691,7 +730,12 @@ def _main():
     # Now let's wait for checksum data to come in
     number_unique_files = len(source_image_info['source_file_dict'])
     number_copies_of_unique_files = 1 + len(program_options['sourcedirs']['additional']) + len(program_options['destination_folders'])
+
     checksum_manager.validate_all_checksums_match( number_unique_files, number_copies_of_unique_files )
+    time_end = time.perf_counter()
+    time_copy_checksum_seconds = time_end - time_start
+    perftimer.add_perf_timing( "Copy/checksum all files, validate checksums", time_copy_checksum_seconds)
+
 
     # Now clean up the reader/writer processes
 
@@ -710,6 +754,12 @@ def _main():
         #print( "Parent had destination writer child process rejoin")
 
     #print( "parent terminating cleanly" )
+
+    _print_io_stats( source_image_info, time_copy_checksum_seconds, number_copies_of_unique_files,
+                     len(program_options['destination_folders']) )
+
+    print( "")
+    perftimer.display_performance()
 
 if __name__ == "__main__":
     _main()
