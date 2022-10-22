@@ -9,6 +9,8 @@ import exiftool             # Requires pip3 install pyexiftool >= 0.5
 import datetime
 import checksum_mgr
 import random
+import time
+
 
 def _parse_args():
     arg_parser = argparse.ArgumentParser(description="End of day script to create validated travel copies of all pics")
@@ -108,12 +110,13 @@ def _enumerate_source_images(program_options):
 def _extract_exif_timestamps( source_file_lists, program_options ):
     print("\nExtracting EXIF timestamps of source images")
 
+    start_time = time.perf_counter()
+
     # Populate EXIF timestamps for all images
     raw_file_list = []
     absolute_path_to_relative_path = {}
     relative_path_reverse_map = {}
     timestamps_sourcedir = program_options['sourcedirs']['timestamps']
-
 
     # Need to get list of files in timestamps sourcedir and get ready to iterate through them
 
@@ -203,7 +206,12 @@ def _extract_exif_timestamps( source_file_lists, program_options ):
     # Debug print one entry to make sure timestamp looks sane
     #print( json.dumps( reverse_map[ raw_file_list[0] ], indent=4, sort_keys=True, default=str) )
 
-    print( f"\tParsed EXIF timestamps from {timestamps_expected} \".{program_options['file_extension']}\" files")
+    end_time = time.perf_counter()
+    timestamp_operation_time_seconds = end_time - start_time
+    timestamps_per_second = timestamps_expected / timestamp_operation_time_seconds
+
+    print( f"\tParsed EXIF timestamps from {timestamps_expected} \".{program_options['file_extension']}\" files" +
+           f" in {timestamp_operation_time_seconds:.02f} seconds ({timestamps_per_second:.02f} timestamps/second)")
 
 
 def _exiftool_worker( worker_name, files_to_timestamp_queue, timestamped_files_queue, all_hashes_read,
@@ -635,6 +643,8 @@ def _main():
     #                                                             indent=4, sort_keys=True, default=str) )
 
     _extract_exif_timestamps( source_file_lists, program_options )
+
+    return
 
     source_image_info = _validate_sourcedir_lists_match(program_options, source_file_lists )
 
