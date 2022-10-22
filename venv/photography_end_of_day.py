@@ -631,9 +631,9 @@ def _print_io_stats ( source_image_info, time_copy_checksum_seconds, number_of_c
     print( "\nIO stats:")
 
     #print( f"\tGB per copy: {gb_per_copy:,.02f}")
-    print( f"\t   Total RAW picture data read: {gb_read:8,.02f} GB ({read_speed:4.02f} GB/s)")
-    print( f"\tTotal RAW picture data written: {gb_written:8,.02f} GB ({write_speed:4.02f} GB/s)")
-    print( f"\t                      Total IO: {total_gb:8,.02f} GB ({total_speed:4.02f} GB/s)")
+    print( f"\t   Total RAW picture data read (checksumming/copying): {gb_read:8,.02f} GB ({read_speed:4.02f} GB/s)")
+    print( f"\tTotal RAW picture data written (creating file copies): {gb_written:8,.02f} GB ({write_speed:4.02f} GB/s)")
+    print( f"\t                                             Total IO: {total_gb:8,.02f} GB ({total_speed:4.02f} GB/s)")
 
 def _main():
     args = _parse_args()
