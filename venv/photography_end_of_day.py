@@ -103,7 +103,7 @@ def _enumerate_source_images(program_options):
 
     for curr_sourcedir in all_sourcedirs:
         source_file_lists[curr_sourcedir] = _scan_source_dir_for_images(curr_sourcedir, program_options )
-        print( f"\tFound {len(source_file_lists[curr_sourcedir])} \".{program_options['file_extension']}\" files" )
+        print( f"\tFound {len(source_file_lists[curr_sourcedir]):,} \".{program_options['file_extension']}\" files" )
 
     return source_file_lists
 
@@ -211,7 +211,7 @@ def _extract_exif_timestamps( source_file_lists, program_options ):
     timestamp_operation_time_seconds = end_time - start_time
     timestamps_per_second = timestamps_expected / timestamp_operation_time_seconds
 
-    print( f"\tParsed EXIF timestamps from {timestamps_expected} \".{program_options['file_extension']}\" files" +
+    print( f"\tParsed EXIF timestamps from {timestamps_expected:,} \".{program_options['file_extension']}\" files" +
            f" in {timestamp_operation_time_seconds:.02f} seconds ({timestamps_per_second:.02f} timestamps/second)")
 
 

@@ -38,11 +38,11 @@ class PerformanceTimer:
 
             for curr_entry in self._perf_data['entries']:
                 percentage_time = (curr_entry['value'] / self._perf_data['total']) * 100.0
-                print(f"\t{curr_entry['label']:>{longest_label_len}s} : {curr_entry['value']:>7.03f} seconds " +
+                print(f"\t{curr_entry['label']:>{longest_label_len}s} : {curr_entry['value']:9,.03f} seconds " +
                       f"({percentage_time:5.01f}%)")
 
             total_label = "Total"
-            print(f"\n\t{total_label:>{longest_label_len}s} : {self._perf_data['total']:>7.03f} seconds")
+            print(f"\n\t{total_label:>{longest_label_len}s} : {self._perf_data['total']:9,.03f} seconds")
 
     __singleton_instance = None
     __singleton_lock = threading.Lock()

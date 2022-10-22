@@ -44,7 +44,7 @@ class ChecksumManager:
                    f"number of unique files ({number_unique_files})")
             validation_passed = False
         else:
-            print( f"\tNumber of unique files checksummed is correct ({number_unique_files})")
+            print( f"\tNumber of unique files checksummed is correct ({number_unique_files:,})")
 
         # For each unique file
         for curr_relative_file in checksum_data_msg:
@@ -67,7 +67,7 @@ class ChecksumManager:
 
         if validation_passed is True:
             total_copies_checked = number_unique_files * number_of_copies_of_each_unique_file
-            print( f"\tTotal number of copies that passed checksums is correct ({total_copies_checked})")
+            print( f"\tTotal number of copies that passed checksums is correct ({total_copies_checked:,})")
             print( "\tAll validation checks passed successfully!" )
         else:
             print( "\tSome validation tests failed")
