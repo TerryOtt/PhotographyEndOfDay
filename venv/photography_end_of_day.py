@@ -16,9 +16,8 @@ def _parse_args():
     arg_parser.add_argument("--debug", help="Lower logging level from INFO to DEBUG", action="store_true")
 
     # The "Action append" lets the parameter be specified multiple times, but it's still optional so may exist no times
-    arg_parser.add_argument("--sourcedir",
-                            help="Path to a source directory with RAW files",
-                            required=True,
+    arg_parser.add_argument("--additional_sourcedir",
+                            help="Path to additional copies of RAW files that will NOT be used for EXIF timestamps",
                             action='append')
 
     arg_parser.add_argument("--timestamp_utc_offset_hours",
@@ -41,6 +40,10 @@ def _parse_args():
                             default=checksum_queue_length_default,
                             type=int)
 
+    arg_parser.add_argument("timestamps_sourcedir",
+                            help="Mandatory sourcedir that will be used for obtaining EXIF timestamps " + \
+                                 "(should be fastest source drive available" )
+
     known_raw_file_extensions = ['NEF', 'CR3']
     arg_parser.add_argument("raw_file_fileext",
                             type=str.upper,
@@ -49,7 +52,8 @@ def _parse_args():
 
     arg_parser.add_argument("travel_storage_media_folder", nargs="+",
                             help="Travel storage folder " + \
-                                 "(e.g., laptop NVMe drive, SanDisk Extreme Pro 4TB, WD My Passport 4TB)")
+                                 "(e.g., laptop NVMe drive, SanDisk Extreme Pro V2 4TB, Orico NVMe enclosure, " +
+                                 "WD My Passport 4TB)")
 
     return arg_parser.parse_args()
 
@@ -90,32 +94,55 @@ def _enumerate_source_images(program_options):
     source_file_lists = {}
 
     # Create a dictionary that maps all absolute file paths to the relative one they have in common
-    for curr_sourcedir in program_options['sourcedirs']:
+    all_sourcedirs = [ program_options['sourcedirs']['timestamps'], ]
+    for curr_sourcedir in program_options['sourcedirs']['additional']:
+        all_sourcedirs.append( curr_sourcedir)
+
+    for curr_sourcedir in all_sourcedirs:
         source_file_lists[curr_sourcedir] = _scan_source_dir_for_images(curr_sourcedir, program_options )
         print( f"\tFound {len(source_file_lists[curr_sourcedir])} \".{program_options['file_extension']}\" files" )
 
     return source_file_lists
 
 
-def _extract_exif_timestamps( program_options, source_file_lists ):
-    print("\nExtracting EXIF timestamps from all source images")
+def _extract_exif_timestamps( source_file_lists, program_options ):
+    print("\nExtracting EXIF timestamps of source images")
 
     # Populate EXIF timestamps for all images
     raw_file_list = []
-    reverse_map = {}
-    for curr_sourcedir in source_file_lists:
-        for (index, curr_file_entry) in enumerate(source_file_lists[curr_sourcedir]):
-            raw_file_list.append(curr_file_entry['file_path']['absolute'])
+    absolute_path_to_relative_path = {}
+    relative_path_reverse_map = {}
+    timestamps_sourcedir = program_options['sourcedirs']['timestamps']
 
-            # Store a reference into the source array keyed by absolute filename so we can do an O(1) lookup
-            #   when we need to update with the timestamp
-            reverse_map[ curr_file_entry['file_path']['absolute'] ] = source_file_lists[curr_sourcedir][index]
+
+    # Need to get list of files in timestamps sourcedir and get ready to iterate through them
+
+    # for curr_sourcedir in source_file_lists:
+    #     for (index, curr_file_entry) in enumerate(source_file_lists[curr_sourcedir]):
+    #         raw_file_list.append(curr_file_entry['file_path']['absolute'])
+    #
+    #         # Store a reference into the source array keyed by absolute filename so we can do an O(1) lookup
+    #         #   when we need to update with the timestamp
+    #         reverse_map[ curr_file_entry['file_path']['absolute'] ] = source_file_lists[curr_sourcedir][index]
+
+    for (index, curr_file_entry) in enumerate(source_file_lists[timestamps_sourcedir]):
+        raw_file_list.append(curr_file_entry['file_path']['absolute'])
+        absolute_path_to_relative_path[curr_file_entry['file_path']['absolute']] = curr_file_entry['file_path']['relative']
+
+    # Now walk through ALL files in all sourcedirs. For each relative path, point it at the sourcedir dict so
+    # we can ad the timestamp there as well
+    for curr_sourcedir in source_file_lists:
+        #print( f"Working sourcedir {curr_sourcedir}")
+        for (index, curr_file_entry) in enumerate(source_file_lists[curr_sourcedir]):
+            relative_path = curr_file_entry['file_path']['relative']
+            #print(f"\tFound relative path {relative_path}")
+
+            if relative_path not in relative_path_reverse_map:
+                relative_path_reverse_map[ relative_path ] = []
+
+            relative_path_reverse_map[ relative_path ].append( source_file_lists[curr_sourcedir][index] )
 
     #print( f"Reverse map created:\n{json.dumps(reverse_map, indent=4, sort_keys=True)}")
-
-    # Randomly shuffle the file list so that we send our queries across a fairly even distribution of sourcedirs
-    #   e.g., don't send all drive 1 entries then drive 2 entries, this keeps the load even over all sourcedirs
-    random.shuffle(raw_file_list)
 
     # Two queues, one to send files to process to workers, one for workers to send us timestamps back
     files_to_timestamp_queue = multiprocessing.Queue()
@@ -149,7 +176,16 @@ def _extract_exif_timestamps( program_options, source_file_lists ):
             extracted_timestamp_info = timestamped_files_queue.get_nowait()
             timestamps_received += 1
 
-            reverse_map[ extracted_timestamp_info['absolute_path'] ]['timestamp'] = extracted_timestamp_info['timestamp']
+            #print( f"Got timestamp for absolute path {extracted_timestamp_info['absolute_path']}")
+
+            # Update timestamp in all sourcedirs
+            relative_path_for_absolute_path = absolute_path_to_relative_path[ extracted_timestamp_info['absolute_path']]
+            sourcedir_entries_for_this_relative_path = relative_path_reverse_map[ relative_path_for_absolute_path ]
+            #print( f"Sourcedirs associated to relative path {relative_path_for_absolute_path}: ")
+            #print( json.dumps(sourcedir_entries_for_this_relative_path, indent=4, sort_keys=True))
+
+            for curr_sourcedir_entry in sourcedir_entries_for_this_relative_path:
+                curr_sourcedir_entry['timestamp'] = extracted_timestamp_info['timestamp']
 
         except queue.Empty:
             # No worries, just loop back and try it all again
@@ -199,26 +235,39 @@ def _exiftool_worker( worker_name, files_to_timestamp_queue, timestamped_files_q
 
             timestamped_files_queue.put( extracted_timestamp )
 
+
+
+def _sourcedir_entries_match( sourcedir_entry_1, sourcedir_entry_2 ):
+    return sourcedir_entry_1['file_path']['relative'] == sourcedir_entry_2['file_path']['relative'] and \
+            sourcedir_entry_1['filesize_bytes'] == sourcedir_entry_2['filesize_bytes'] and \
+            sourcedir_entry_1['timestamp'] == sourcedir_entry_2['timestamp']
+
+
 def _validate_sourcedir_lists_match( program_options, source_file_lists ):
 
     print("\nValidating all sourcedir file lists are identical")
 
-    # Make sure all file lists came out identical
-    for curr_sourcedir in program_options['sourcedirs'][2:]:
-        if source_file_lists[program_options['sourcedirs'][0]] != source_file_lists[curr_sourcedir]:
-            logging.error( "Contents of source dirs do not match, bailing")
-            sys.exit( 1 )
+    # Make sure all sourcedir lists match on everything but absolute path
+    timestamp_sourcedir_entries = source_file_lists[program_options['sourcedirs']['timestamps']]
+    for (index, curr_timestamp_sourcedir_entry) in enumerate(timestamp_sourcedir_entries):
+        # Walk additionals and make sure that same offset into list matches on everything but absolute path
+        for curr_additional_sourcedir in program_options['sourcedirs']['additional']:
+            curr_additional_sourcedir_entry = source_file_lists[curr_additional_sourcedir][index]
+
+            if _sourcedir_entries_match( curr_timestamp_sourcedir_entry, curr_additional_sourcedir_entry) is False:
+                logging.error( "Contents of source dirs do not match, bailing")
+                sys.exit( 1 )
 
     print( "\tMetadata contents of all sourcedirs match!")
 
-    total_file_count = len( source_file_lists[program_options['sourcedirs'][0]] )
+    total_file_count = len( source_file_lists[program_options['sourcedirs']['timestamps']] )
 
     #total_file_count = 9876
 
     # Create return list (only need relative paths)
     file_dict = {}
     total_file_bytes = 0
-    for curr_file_entry in source_file_lists[program_options['sourcedirs'][0]]:
+    for curr_file_entry in source_file_lists[program_options['sourcedirs']['timestamps']]:
         file_dict[ curr_file_entry['file_path']['relative']] = {
             'filesize_bytes'    : curr_file_entry['filesize_bytes'],
             'timestamp'         : curr_file_entry['timestamp']
@@ -418,7 +467,7 @@ def _launch_destination_writers(program_options, display_console_messages_queue,
 
     writer_process_handles = []
 
-    number_of_sourcedirs = len(program_options['sourcedirs'])
+    number_of_sourcedirs = 1 + len(program_options['sourcedirs']['additional'])
 
     # Create processes to write to each destination
     for (i, curr_dest_folder) in enumerate(program_options['destination_folders']):
@@ -538,8 +587,12 @@ def _launch_sourcedir_readers( program_options, source_image_info, display_conso
 
     reader_process_handles = []
     #print( f"Destination writers:\n{json.dumps(destination_writers, indent=4, sort_keys=True, default=str)}")
+    all_sourcedirs = [ program_options['sourcedirs']['timestamps'], ]
 
-    for ( i, curr_sourcedir ) in enumerate( program_options['sourcedirs']):
+    for curr_additional_dir in program_options['sourcedirs']['additional']:
+        all_sourcedirs.append( curr_additional_dir)
+
+    for ( i, curr_sourcedir ) in enumerate( all_sourcedirs):
         curr_handle = multiprocessing.Process( target=_read_from_sourcedir_worker,
                                                args=(curr_sourcedir, source_image_info['source_file_dict'],
                                                      display_console_messages_queue,
@@ -561,10 +614,13 @@ def _main():
 
     logging.basicConfig(level=log_level)
 
-    if args.sourcedir:
-        program_options['sourcedirs'] = sorted(args.sourcedir)
+    program_options['sourcedirs'] = {}
+    if args.additional_sourcedir:
+        program_options['sourcedirs']['additional'] = sorted(args.additional_sourcedir)
     else:
-        program_options['sourcedirs'] = []
+        program_options['sourcedirs']['additional'] = []
+
+    program_options['sourcedirs']['timestamps'] = args.timestamps_sourcedir
 
     program_options['file_extension'] = args.raw_file_fileext.lower()
     program_options['timestamp_utc_offset_hours'] = args.timestamp_utc_offset_hours
@@ -578,9 +634,11 @@ def _main():
     #print( "\nSource file info:\n" + json.dumps(source_image_info['source_file_dict'],
     #                                                             indent=4, sort_keys=True, default=str) )
 
-    _extract_exif_timestamps( program_options, source_file_lists )
+    _extract_exif_timestamps( source_file_lists, program_options )
 
     source_image_info = _validate_sourcedir_lists_match(program_options, source_file_lists )
+
+    #print( "Source image info:\n" + json.dumps(source_image_info, indent=4, sort_keys=True, default=str))
 
     # Determine unique filenames
     _set_destination_filenames( program_options, source_image_info['source_file_dict'] )
@@ -589,7 +647,7 @@ def _main():
     display_console_messages_queue = multiprocessing.Queue()
 
     checksum_manager = checksum_mgr.ChecksumManager(len(source_image_info['source_file_dict']) *
-                                                    (len(program_options['sourcedirs']) +
+                                                    (1 + len(program_options['sourcedirs']['additional']) +
                                                      len(program_options['destination_folders'])),
                                                     display_console_messages_queue,
                                                     program_options['checksum_queue_length'],
@@ -622,7 +680,7 @@ def _main():
 
     # Now let's wait for checksum data to come in
     number_unique_files = len(source_image_info['source_file_dict'])
-    number_copies_of_unique_files = len(program_options['sourcedirs']) + len(program_options['destination_folders'])
+    number_copies_of_unique_files = 1 + len(program_options['sourcedirs']['additional']) + len(program_options['destination_folders'])
     checksum_manager.validate_all_checksums_match( number_unique_files, number_copies_of_unique_files )
 
     # Now clean up the reader/writer processes
