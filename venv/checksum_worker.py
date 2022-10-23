@@ -189,7 +189,7 @@ def _checksum_worker(child_worker_index, files_to_checksum_queue, checksums_comp
 
             # Do we have a hash handle for this file?
             if file_absolute_path not in hashlib_handles:
-                hashlib_handles[ file_absolute_path ] = hashlib.sha3_512()
+                hashlib_handles[ file_absolute_path ] = hashlib.sha3_256()
 
 
             # print( f"Worker {child_worker_index} got checksum data for " +

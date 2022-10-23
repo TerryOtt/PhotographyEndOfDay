@@ -29,7 +29,7 @@ def _parse_args():
                             default=0)
 
     #num_checksum_processes_default = multiprocessing.cpu_count() - 1
-    num_checksum_processes_default = 6      # Determined experimentally
+    num_checksum_processes_default = 4     # Determined experimentally
     arg_parser.add_argument("--checksum_processes",
                             help="Number of checksum processes to launch" +
                                 f" (default on this computer: {num_checksum_processes_default})",
