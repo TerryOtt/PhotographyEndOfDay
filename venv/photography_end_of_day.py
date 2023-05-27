@@ -1,60 +1,70 @@
-# import pprint
-import json
-import logging
 import argparse
-import time
-import os
-import hashlib
 import multiprocessing
+import logging
+import json
+import os
 import queue
-import exiftool
+import sys
+import exiftool             # Requires pip3 install pyexiftool >= 0.5
 import datetime
-import shutil
-import pathlib
-import glob
-import performance_timer
+import checksum_mgr
 import random
-import shutil
-import xml.etree.ElementTree
-import copy
+import time
+import performance_timer
 
-
-#num_worker_processes = multiprocessing.cpu_count() - 2
-max_processes_running = 15
-curr_processes_running = 1
 
 def _parse_args():
-    arg_parser = argparse.ArgumentParser(description="End of day script to validate data, geotag, copy to SSD")
-    arg_parser.add_argument("--debug", help="Lower logging level from INFO to DEBUG", action="store_true" )
-    arg_parser.add_argument("--logfile", help="Path to file where the app log will be created",
-                            default="photo_end_of_day.log" )
-    arg_parser.add_argument( "--singlethreaded", help="Disable multi-threading, do everything single threaded",
-                             action="store_true" )
-    arg_parser.add_argument( "--sourcedir_full",
-                             help="Path to a source directory with the *full* set of contents",
-                             required=True )
+    arg_parser = argparse.ArgumentParser(description="End of day script to create validated travel copies of all pics")
+
+    arg_parser.add_argument("--debug", help="Lower logging level from INFO to DEBUG", action="store_true")
 
     # The "Action append" lets the parameter be specified multiple times, but it's still optional so may exist no times
-    arg_parser.add_argument( "--sourcedir_partial",
-                             help="Path to a source directory with a *partial* set of the contents",
-                             action="append")
-    arg_parser.add_argument( "fileext", help="File extension, e.g. \"NEF\", \"CR3\""  )
-    arg_parser.add_argument("file_timestamp_utc_offset_hours",
-                            help="Hours offset from UTC, e.g. EDT is -4, Afghanistan is +4.5",
-                            type=float)
-    #gpx_file_folder", help="Path to folder with all GPX files for these pictures")
-    arg_parser.add_argument( "laptop_destination_folder", help="Path to storage folder on laptop NVMe" )
-    arg_parser.add_argument( "travel_storage_media_folder", nargs="+",
-                             help="External travel storage media folder " + \
-                                  "(e.g., SanDisk Extreme Pro 4TB, WD My Passport 4TB)")
+    arg_parser.add_argument("--additional_sourcedir",
+                            help="Path to additional copies of RAW files that will NOT be used for EXIF timestamps",
+                            action='append')
+
+    arg_parser.add_argument("--timestamp_utc_offset_hours",
+                            help="Integer hours offset from UTC, e.g., EDT is -4, PDT is -7",
+                            type=int,
+                            default=0)
+
+    #num_checksum_processes_default = multiprocessing.cpu_count() - 1
+    num_checksum_processes_default = 4     # Determined experimentally
+    arg_parser.add_argument("--checksum_processes",
+                            help="Number of checksum processes to launch" +
+                                f" (default on this computer: {num_checksum_processes_default})",
+                            default=num_checksum_processes_default,
+                            type=int )
+
+    checksum_queue_length_default = 9500            # Determined experimentally
+    arg_parser.add_argument("--checksum_queue_length",
+                            help="Length of the checksum queue " +
+                                 f" (default on this computer: {checksum_queue_length_default})",
+                            default=checksum_queue_length_default,
+                            type=int)
+
+    arg_parser.add_argument("timestamps_sourcedir",
+                            help="Mandatory sourcedir that will be used for obtaining EXIF timestamps " + \
+                                 "(should be fastest source drive available" )
+
+    known_raw_file_extensions = ['NEF', 'CR3']
+    arg_parser.add_argument("raw_file_fileext",
+                            type=str.upper,
+                            choices=known_raw_file_extensions,
+                            help=f"File extension for RAW files" )
+
+    arg_parser.add_argument("travel_storage_media_folder", nargs="+",
+                            help="Travel storage folder " + \
+                                 "(e.g., laptop NVMe drive, SanDisk Extreme Pro V2 4TB, Orico NVMe enclosure, " +
+                                 "WD My Passport 4TB)")
 
     return arg_parser.parse_args()
 
 
-def _scan_source_dir_for_images( curr_source_dir, program_options, source_list_type, directory_scan_results_queue ):
+def _scan_source_dir_for_images( curr_source_dir, program_options ):
     image_files = []
     cumulative_bytes = 0
-    #print(f"\tChild process starting walk of {curr_source_dir}")
+    print(f"\tFinding \".{program_options['file_extension']}\" files in sourcedir \"{curr_source_dir}\"")
 
     for subdir, dirs, files in os.walk(curr_source_dir):
         for filename in files:
@@ -79,1189 +89,551 @@ def _scan_source_dir_for_images( curr_source_dir, program_options, source_list_t
                 pass
 
     # Walk complete, send results to parent
-    results_of_walk = {
-        'source_dir'        : curr_source_dir,
-        'source_list_type'  : source_list_type,
-        'image_files_found' : image_files,
-    }
-
-    directory_scan_results_queue.put( results_of_walk )
-
-    # Now can terminate child worker process cleanly, ready to rejoin with parent
-    #print( f"\tChild process walking {curr_source_dir} terminated cleanly")
-
+    return image_files
 
 def _enumerate_source_images(program_options):
-    start_time = time.perf_counter()
-
     print( "\nEnumerating source images")
 
-    global curr_processes_running
+    source_file_lists = {}
 
-    source_file_lists = {
-        'full': {},
-        'partial': None,
-    }
+    # Create a dictionary that maps all absolute file paths to the relative one they have in common
+    all_sourcedirs = [ program_options['sourcedirs']['timestamps'], ]
+    for curr_sourcedir in program_options['sourcedirs']['additional']:
+        all_sourcedirs.append( curr_sourcedir)
 
-    process_handles = []
+    for curr_sourcedir in all_sourcedirs:
+        source_file_lists[curr_sourcedir] = _scan_source_dir_for_images(curr_sourcedir, program_options )
+        print( f"\tFound {len(source_file_lists[curr_sourcedir]):,} \".{program_options['file_extension']}\" files" )
 
-    # Queue that children use to write results of directory scan back to parent
-    directory_scan_results_queue = multiprocessing.Queue()
-
-    # Fire off scanner for the directory with ALL the shots (e.g., 512 GB CFexpress Type B card with *all* the shots for the day)
-    which_source_list = 'full'
-    curr_handle = multiprocessing.Process(target=_scan_source_dir_for_images,
-                                             args=(program_options['sourcedirs']['full'],
-                                                   program_options,
-                                                   which_source_list,
-                                                   directory_scan_results_queue))
-
-    curr_handle.start()
-    curr_processes_running += 1
-    print(f"\tScanning \"{program_options['sourcedirs']['full']}\" for RAW image files with extension " +
-          f"\".{program_options['file_extension']}\" (full contents)")
-
-    process_handles.append(curr_handle)
-
-    directories_scanned = 1
-
-    #Now fire off scanners for directories with partial contents (e.g., 256 GB SD card with half the day's shots) -- if any
-    if program_options['sourcedirs']['partial']:
-        which_source_list = 'partial'
-        for curr_partial_dir in sorted(program_options['sourcedirs']['partial']):
-            curr_handle = multiprocessing.Process(target=_scan_source_dir_for_images,
-                                                     args=(curr_partial_dir,
-                                                           program_options,
-                                                           which_source_list,
-                                                           directory_scan_results_queue))
-            curr_handle.start()
-            curr_processes_running += 1
-            print(f"\tScanning \"{curr_partial_dir}\" for RAW image files with extension " +
-                  f".\"{program_options['file_extension']}\" (partial contents)")
-
-            process_handles.append(curr_handle)
-            directories_scanned += 1
-
-    # Children cannot terminate with a queue that's full, so drain the results queue
-    for curr_index in range( directories_scanned ):
-        scan_results = directory_scan_results_queue.get()
-        #print( f"\tGot scan results for \"{scan_results['source_dir']}\" back")
-
-        if scan_results['source_list_type'] == 'full':
-            source_file_list_to_populate = source_file_lists['full']
-        elif scan_results['source_list_type'] == 'partial':
-            if source_file_lists['partial'] is None:
-                source_file_lists['partial'] = {}
-            source_file_list_to_populate = source_file_lists['partial']
-
-        for curr_dir_scan_result in scan_results['image_files_found']:
-            curr_relative_path_file_name = curr_dir_scan_result['file_path']['relative']
-
-            if curr_relative_path_file_name in source_file_list_to_populate:
-                raise ValueError(f"Found duplicate entry {curr_relative_path_file_name} in a file listing -- WTF!?!?!")
-
-            # Put the confirmed-unique entry into the file list
-            source_file_list_to_populate[curr_relative_path_file_name] = curr_dir_scan_result
-
-    # Wait for all the children to rejoin cleanly
-    while process_handles:
-        rejoin_handle = process_handles.pop()
-        #print( f"Waiting for {pprint.pformat(rejoin_handle)} to rejoin")
-        rejoin_handle.join()
-        curr_processes_running -= 1
-        #print( "Child process rejoined" )
-
-    #print( "\tAll workers have rejoined cleanly" )
-
-    # We've populated the full list, and the partial list (if we got partial dirs). Need to make sure
-    #   the partial list matches the full list (only worry about relative filenames -- we'll check contents later when we're
-    #   doing the manifests and are hashing the shit out of everything
-    if source_file_lists['partial'] is not None:
-        if sorted(source_file_lists['full'].keys()) != sorted( source_file_lists['partial'].keys() ):
-            raise ValueError("List of relative files in full and partial lists did not match")
-        print( "\tCool, the full file list and the combined results of all the partials give us same file list!")
-
-    total_file_count = len( source_file_lists['full'].keys() )
-
-    # Create a directory that maps all absolute file paths to the relative one they have in common
-    reverse_file_list = {}
-    for curr_relative_path in sorted( source_file_lists['full'] ):
-        reverse_file_list[ source_file_lists['full'][curr_relative_path][ 'file_path'][ 'absolute' ] ] = curr_relative_path
-
-    if source_file_lists['partial'] is not None:
-        for curr_relative_path in sorted( source_file_lists['partial'] ):
-            reverse_file_list[ source_file_lists['partial'][curr_relative_path]['file_path']['absolute'] ] = curr_relative_path
-
-    end_time = time.perf_counter()
-
-    operation_time_seconds = end_time - start_time
-    #logging.debug( f"Enumerate time: {(operation_time_seconds):.03f} seconds" )
-
-    print ( f"\tFound {total_file_count} .{program_options['file_extension']} files")
-
-    return {
-        'source_file_list'          : source_file_lists['full'],
-        'reverse_map'               : reverse_file_list,
-        'operation_time_seconds'    : operation_time_seconds,
-    }
+    return source_file_lists
 
 
-def _generate_source_manifest( reverse_file_map, source_file_list ):
+def _extract_exif_timestamps( source_file_lists, program_options ):
+    print("\nExtracting EXIF timestamps of source images")
+
     start_time = time.perf_counter()
 
-    print( "\nGenerating source manifest")
+    # Populate EXIF timestamps for all images
+    raw_file_list = []
+    absolute_path_to_relative_path = {}
+    relative_path_reverse_map = {}
+    timestamps_sourcedir = program_options['sourcedirs']['timestamps']
 
-    global curr_processes_running
+    # Need to get list of files in timestamps sourcedir and get ready to iterate through them
 
-    # Queue with filenames that hash workers will read and hash
-    files_to_hash_queue = multiprocessing.Queue()
+    # for curr_sourcedir in source_file_lists:
+    #     for (index, curr_file_entry) in enumerate(source_file_lists[curr_sourcedir]):
+    #         raw_file_list.append(curr_file_entry['file_path']['absolute'])
+    #
+    #         # Store a reference into the source array keyed by absolute filename so we can do an O(1) lookup
+    #         #   when we need to update with the timestamp
+    #         reverse_map[ curr_file_entry['file_path']['absolute'] ] = source_file_lists[curr_sourcedir][index]
 
-    # Queue that hash workers use to pass hash data back to parent
-    completed_files_queue = multiprocessing.Queue()
+    for (index, curr_file_entry) in enumerate(source_file_lists[timestamps_sourcedir]):
+        raw_file_list.append(curr_file_entry['file_path']['absolute'])
+        absolute_path_to_relative_path[curr_file_entry['file_path']['absolute']] = curr_file_entry['file_path']['relative']
+
+    # Now walk through ALL files in all sourcedirs. For each relative path, point it at the sourcedir dict so
+    # we can ad the timestamp there as well
+    for curr_sourcedir in source_file_lists:
+        #print( f"Working sourcedir {curr_sourcedir}")
+        for (index, curr_file_entry) in enumerate(source_file_lists[curr_sourcedir]):
+            relative_path = curr_file_entry['file_path']['relative']
+            #print(f"\tFound relative path {relative_path}")
+
+            if relative_path not in relative_path_reverse_map:
+                relative_path_reverse_map[ relative_path ] = []
+
+            relative_path_reverse_map[ relative_path ].append( source_file_lists[curr_sourcedir][index] )
+
+    #print( f"Reverse map created:\n{json.dumps(reverse_map, indent=4, sort_keys=True)}")
+
+    # Two queues, one to send files to process to workers, one for workers to send us timestamps back
+    files_to_timestamp_queue = multiprocessing.Queue()
+    timestamped_files_queue = multiprocessing.Queue()
 
     # Event to tell everyone when all the work is done
     all_hashes_read = multiprocessing.Event()
 
-    # Launch hash workers
-    hash_worker_handles = []
+    num_exiftool_workers = multiprocessing.cpu_count() - 1
+    exiftool_worker_handles = []
+    for i in range( num_exiftool_workers ):
+        worker_name = f"exiftool_worker_{i+1}"
+        curr_handle = multiprocessing.Process(target=_exiftool_worker,
+                                              args=(worker_name, files_to_timestamp_queue, timestamped_files_queue,
+                                                    all_hashes_read, program_options['timestamp_utc_offset_hours']) )
+        exiftool_worker_handles.append(curr_handle)
+        curr_handle.start()
 
-    num_worker_processes = max_processes_running - curr_processes_running
+    timestamps_received = 0
+    timestamps_expected = len(raw_file_list)
+    curr_file_index_to_send = 0
 
-    for i in range( num_worker_processes ):
-        process_handle = multiprocessing.Process( target=_hash_worker,
-                                                  args=(i+1, files_to_hash_queue,
-                                                        completed_files_queue,
-                                                        all_hashes_read) )
+    while timestamps_received < timestamps_expected:
+        # Send a file to timestamp
+        if curr_file_index_to_send < timestamps_expected:
+            files_to_timestamp_queue.put( raw_file_list[curr_file_index_to_send] )
+            curr_file_index_to_send += 1
 
-        process_handle.start()
-        curr_processes_running += 1
-        #print(f"Parent back from start on hash worker {i+1}")
-        hash_worker_handles.append( process_handle )
-    #print( "All hash workers started" )
+        # Read extracted timestamps until queue is empty
+        try:
+            extracted_timestamp_info = timestamped_files_queue.get_nowait()
+            timestamps_received += 1
 
-    source_manifest = {}
+            #print( f"Got timestamp for absolute path {extracted_timestamp_info['absolute_path']}")
 
-    # # Ahhh think I know. We set total hash count expected incorrectly.  need to do that based on reverse map
-    # print( f"\tReverse map (all copies of all files) has {len(reverse_file_map.keys())} entries")
-    # return
+            # Update timestamp in all sourcedirs
+            relative_path_for_absolute_path = absolute_path_to_relative_path[ extracted_timestamp_info['absolute_path']]
+            sourcedir_entries_for_this_relative_path = relative_path_reverse_map[ relative_path_for_absolute_path ]
+            #print( f"Sourcedirs associated to relative path {relative_path_for_absolute_path}: ")
+            #print( json.dumps(sourcedir_entries_for_this_relative_path, indent=4, sort_keys=True))
 
-    # We know how many files we wrote into the queue that children read out of. Now read
-    #   same number of entries out of the processed data queue
-    hashes_received = 0
-    #pprint.pprint( source_file_list)
-    #return
-    total_hash_count = len(reverse_file_map.keys())
-    filenames_left_to_send = total_hash_count
+            for curr_sourcedir_entry in sourcedir_entries_for_this_relative_path:
+                curr_sourcedir_entry['timestamp'] = extracted_timestamp_info['timestamp']
 
-    # We shuffle this list to ensure that we pull files from all source drives equally without needing to
-    #       create lists of which files are on which drives. Easier and same end effect
-    shuffled_absolute_path_list = list( reverse_file_map.keys() )
-    random.shuffle( shuffled_absolute_path_list )
+        except queue.Empty:
+            # No worries, just loop back and try it all again
+            pass
 
-    total_file_count = len( source_file_list.keys() )
-    #print( f"\tHashing {total_hash_count} files in order to confirm all copies of {total_file_count} manifest entries match")
-    while hashes_received < total_hash_count:
-        # Populate the filename hash list
-        filenames_to_send = min( filenames_left_to_send, num_worker_processes )
-        for i in range( filenames_to_send ):
-            curr_absolute_path = shuffled_absolute_path_list.pop()
-            files_to_hash_queue.put(
-                {
-                    'paths': {
-                        'absolute': curr_absolute_path,
-                        'relative': reverse_file_map[ curr_absolute_path ]
-                    }
-                }
-            )
-            filenames_left_to_send -= 1
-            #print( "Sent filename")
-
-        # Read from completed queue until empty, that'll keep workers busy
-        if hashes_received < total_hash_count:
-            while True:
-                # Read the completed queue
-                try:
-                    file_hash_data = completed_files_queue.get_nowait()
-                except queue.Empty:
-                    break
-
-                # If the relative path exists in the source manifest, make sure the hashes line up!
-                relative_path = file_hash_data['paths']['relative']
-                if relative_path in source_manifest:
-                    if file_hash_data['hashes'] != source_manifest[relative_path]['hashes']:
-                        raise ValueError( f"Got hash file mismatch on {relative_path}")
-                else:
-                    source_manifest[ relative_path ] = {
-                        'hashes'            : file_hash_data['hashes'],
-                        'filesize_bytes'    : source_file_list[ relative_path ]['filesize_bytes']
-                    }
-
-                hashes_received += 1
-                #print( f"\tParent got hash {hashes_received}" )
-
-                # Can now delete from reverse map, no longer needed
-                del reverse_file_map[ file_hash_data['paths']['absolute'] ]
-                file_hash_data = None
-        #print("Parent done with iteration of reading hash results, going to try sending more data")
-
-    #print( "Parent done reading and writing from queues")
-    #print( f"\tGot {len(source_manifest.keys())} unique relative file paths out of total of {total_hash_count} source files")
-
-    # Signal that the hash workers can now terminate cleanly
-    #print( "\tAll hashes read by parent, signaling hash workers to come home")
+    # Let the children know we're all done
     all_hashes_read.set()
 
-    # Rejoin all processes we spawned
-
-    while hash_worker_handles:
-        curr_handle = hash_worker_handles.pop()
+    # Land all the worker processes and clean up their resources
+    while exiftool_worker_handles:
+        curr_handle = exiftool_worker_handles.pop()
         curr_handle.join()
-        curr_processes_running -= 1
-    #print("All hash workers rejoined")
+        curr_handle.close()
+
+    # Debug print one entry to make sure timestamp looks sane
+    #print( json.dumps( reverse_map[ raw_file_list[0] ], indent=4, sort_keys=True, default=str) )
 
     end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
+    timestamp_operation_time_seconds = end_time - start_time
+    timestamps_per_second = timestamps_expected / timestamp_operation_time_seconds
 
-    print (f"\tSource manifest created for all {total_file_count} unique image files, computed from {total_hash_count} separate files to make sure all copies match")
-
-    return {
-        "operation_time_seconds"    : operation_time_seconds,
-        "source_manifest"           : source_manifest,
-    }
+    print( f"\tParsed EXIF timestamps from {timestamps_expected:,} \".{program_options['file_extension']}\" files" +
+           f" in {timestamp_operation_time_seconds:.02f} seconds ({timestamps_per_second:.02f} timestamps/second)")
 
 
-
-def _hash_worker( hash_worker_index, source_filecontents_queue, contents_hash_queue, all_hashes_read ):
-    while True:
-        try:
-            curr_file_entry = source_filecontents_queue.get(timeout=0.1)
-        except queue.Empty:
-            # Test to see if the parent has read all the data out, otherwise we're not done
-            if all_hashes_read.is_set() is False:
-                continue
-            else:
-                break
-
-        with open( curr_file_entry['paths']['absolute'], "rb") as file_handle:
-            file_bytes = file_handle.read()
-
-        #print( f"Child {worker_index} got file info:\n{json.dumps(curr_file_entry, indent=4, sort_keys=True)}")
-
-        computed_hashes = {
-            #"sha3_384"  :   hashlib.sha3_384(file_bytes).hexdigest(),
-            "sha3_512"  :   hashlib.sha3_512(file_bytes).hexdigest(),
-        }
-
-        #print( f"{curr_file_entry['absolute_path']}: {computed_hashes['sha3_512']}")
-
-        contents_hash_queue.put(
-            {
-                "paths":  curr_file_entry['paths'],
-                "hashes": computed_hashes,
-            }
-        )
-
-        # Release our reference to the file entry
-        curr_file_entry = None
-
-    #print( f"Hash worker {hash_worker_index} terminating cleanly" )
-
-
-def _extract_image_timestamps( program_options, source_image_manifest ):
-
-    time_start = time.perf_counter()
-
-    file_data = {}
-    source_image_files = sorted(source_image_manifest.keys())
-    file_count = len(source_image_files)
-
-    print( f"\nExtracting EXIF timestamps from source images")
-    global curr_processes_running
-
-    start_time = time.perf_counter()
-
-    process_handles = []
-
-    #  Queue for sending files needing timestamps to children
-    files_to_process_queue = multiprocessing.Queue(maxsize=file_count)
-
-    # Queue that children use to write EXIF timestamp information data back to parent
-    processed_file_queue = multiprocessing.Queue(maxsize=file_count)
-
-    num_worker_processes = max_processes_running - curr_processes_running
-
-    for i in range(num_worker_processes):
-        process_handle = multiprocessing.Process( target=_exif_timestamp_worker,
-                                                  args=(i+1, files_to_process_queue,
-                                                        processed_file_queue,
-                                                        program_options) )
-
-        process_handle.start()
-        curr_processes_running += 1
-        logging.debug(f"Parent back from start on timestamp child process {i+1}")
-        process_handles.append( process_handle )
-
-    # Load up the queue with all the files to process
-    for curr_file in source_image_files:
-        exif_worker_data = {
-            'paths'             : {
-                'absolute'          : os.path.join(program_options['sourcedirs']['full'], curr_file ),
-                'relative'          : curr_file,
-            },
-            'manifest_data'     : source_image_manifest[curr_file],
-        }
-        logging.debug(f"About to write {json.dumps(exif_worker_data)} to the child queue")
-        files_to_process_queue.put(exif_worker_data)
-
-    # We know how many files we wrote into the queue that children read out of. Now read
-    #   same number of entries out of the processed data queue
-    for i in range( file_count ):
-        exif_timestamp_data = processed_file_queue.get()
-        source_image_manifest[ exif_timestamp_data['paths']['relative']]['timestamp'] = \
-                exif_timestamp_data['timestamp']
-
-    logging.debug( f"Parent process has read out all {file_count} entries from results queue" )
-
-    # Rejoin child threads
-    while process_handles:
-        curr_handle = process_handles.pop()
-        #logging.debug("parent process waiting for child worker to rejoin")
-        curr_handle.join()
-        curr_processes_running -= 1
-        #logging.debug("child process has rejoined cleanly")
-
-    #logging.debug("Parent process exiting, all EXIF timestamp work done")
-
-    time_end = time.perf_counter()
-
-    operation_time_seconds = time_end - time_start
-
-    print( f"\tCompleted for {file_count} source image files")
-
-    return {
-        'operation_time_seconds'    : operation_time_seconds,
-    }
-
-
-def _exif_timestamp_worker( child_process_index, files_to_process_queue, processed_file_queue, program_options ):
-    #print( f"Child {child_process_index} started")
+def _exiftool_worker( worker_name, files_to_timestamp_queue, timestamped_files_queue, all_hashes_read,
+                      timestamp_utc_offset_hours ):
 
     exiftool_tag_name = "EXIF:DateTimeOriginal"
-
-    with exiftool.ExifTool() as exiftool_handle:
-
-        while True:
+    with exiftool.ExifToolHelper() as exiftool_handle:
+        while all_hashes_read.is_set() is False:
             try:
-                # No need to wait, the queue was pre-loaded by the parent
-                curr_file_entry = files_to_process_queue.get( timeout=0.1 )
+                file_to_timestamp = files_to_timestamp_queue.get(timeout=0.1)
             except queue.Empty:
-                # no more work to be done
-                #print( f"Child {child_process_index} found queue empty on get, bailing from processing loop")
-                break
+                continue
 
-            #print( f"Child {child_process_index} read processing entry from queue: " +
-            #    json.dumps(curr_file_entry, indent=4, sort_keys=True) )
+            file_timestamps = exiftool_handle.get_tags( file_to_timestamp, tags = exiftool_tag_name )
+            curr_timestamp_entry = file_timestamps[0]
 
-            absolute_path = curr_file_entry['paths']['absolute']
-
-            exif_datetime = exiftool_handle.get_tag(exiftool_tag_name, absolute_path)
-
-            # Create legit datetime object from string, note: not tz aware (yet)
-            file_datetime_no_tz = datetime.datetime.strptime(exif_datetime, "%Y:%m:%d %H:%M:%S")
-
-            # Do hour shift from timezone-unaware EXIF datetime to UTC
+            file_datetime_no_tz = datetime.datetime.strptime(curr_timestamp_entry[exiftool_tag_name], "%Y:%m:%d %H:%M:%S")
+            # Do hour shift from timezone-unaware EXIF datetime to UTC (still no TZ, just shifting hours)
             shifted_datetime_no_tz = file_datetime_no_tz + datetime.timedelta(
-                hours=-(program_options['file_timestamp_utc_offset_hours']))
-
+                hours=-timestamp_utc_offset_hours )
             # Create TZ-aware datetime, as one should basically always strive to use
             file_datetime_utc = shifted_datetime_no_tz.replace(tzinfo=datetime.timezone.utc)
 
-            # Create an
+            # Send this info back home
+            extracted_timestamp = {
+                'absolute_path' : file_to_timestamp,
+                'timestamp'     : file_datetime_utc,
+            }
 
-            processed_file_queue.put(
-                {
-                    'paths': {
-                        'relative': curr_file_entry['paths']['relative'],
-                    },
-                    'timestamp': file_datetime_utc,
-                }
-            )
+            timestamped_files_queue.put( extracted_timestamp )
 
 
-    #print( f"Child {child_process_index} exiting cleanly")
 
+def _sourcedir_entries_match( sourcedir_entry_1, sourcedir_entry_2 ):
+    return sourcedir_entry_1['file_path']['relative'] == sourcedir_entry_2['file_path']['relative'] and \
+            sourcedir_entry_1['filesize_bytes'] == sourcedir_entry_2['filesize_bytes'] and \
+            sourcedir_entry_1['timestamp'] == sourcedir_entry_2['timestamp']
 
-def _get_existing_files_in_destination( source_file_manifest, program_options ):
 
-    time_start = time.perf_counter()
+def _validate_sourcedir_lists_match( program_options, source_file_lists ):
 
-    print( f"\nStarting search for existing .{program_options['file_extension']} files under " +
-           f"{program_options['laptop_destination_folder']}")
+    print("\nValidating all sourcedir file lists are identical")
 
-    existing_files = {}
+    # Make sure all sourcedir lists match on everything but absolute path
+    timestamp_sourcedir_entries = source_file_lists[program_options['sourcedirs']['timestamps']]
+    for (index, curr_timestamp_sourcedir_entry) in enumerate(timestamp_sourcedir_entries):
+        # Walk additionals and make sure that same offset into list matches on everything but absolute path
+        for curr_additional_sourcedir in program_options['sourcedirs']['additional']:
+            curr_additional_sourcedir_entry = source_file_lists[curr_additional_sourcedir][index]
 
-    total_existing_file_count = 0
+            if _sourcedir_entries_match( curr_timestamp_sourcedir_entry, curr_additional_sourcedir_entry) is False:
+                logging.error( "Contents of source dirs do not match, bailing")
+                sys.exit( 1 )
 
-    # Get all the year/date combos in the source_file_manifest
-    for curr_source_file_manifest_file in source_file_manifest:
-        curr_source_file_manifest_entry = source_file_manifest[curr_source_file_manifest_file]
+    print( "\tMetadata contents of all sourcedirs match!")
 
-        #print( f"Source file entry for {curr_source_file_manifest_file}:\n" + json.dumps(curr_source_file_manifest_entry, indent=4, sort_keys=True, default=str))
+    total_file_count = len( source_file_lists[program_options['sourcedirs']['timestamps']] )
 
-        curr_year = curr_source_file_manifest_entry['timestamp'].year
-        year_str = str(curr_year)
-        curr_month = curr_source_file_manifest_entry['timestamp'].month
-        curr_day = curr_source_file_manifest_entry['timestamp'].day
+    #total_file_count = 9876
 
-        date_string = f"{curr_year:04d}-{curr_month:02d}-{curr_day:02d}"
-
-        #print( f"File: {curr_source_file_manifest_file}, date: \"{date_string}\"")
-
-        if year_str not in existing_files:
-            existing_files[year_str] = {}
-
-        if date_string not in existing_files[year_str]:
-            existing_files[year_str][date_string] = {}
-            #print( f"\tCreated existing files entry for \"{year_str}\{date_string}\"" )
-
-            #print( f"Folder to search: {folder_to_search}")
-            folder_to_search = os.path.join(program_options['laptop_destination_folder'],
-                                            year_str,
-                                            date_string)
-
-            if os.path.exists( folder_to_search ) and os.path.isdir( folder_to_search):
-
-                matching_files = glob.glob( os.path.join( folder_to_search, f"*.{program_options['file_extension']}"))
-
-                total_existing_file_count += len( matching_files )
-
-                for curr_match in matching_files:
-                    existing_files[year_str][date_string][curr_match] = None
-
-                print( f"\tAdded {len(matching_files)} .{program_options['file_extension']} files from {folder_to_search}")
-
-    time_end = time.perf_counter()
-    operation_time_seconds = time_end - time_start
-
-    print( f"\tFound total of {total_existing_file_count} pre-existing .{program_options['file_extension']} files")
-
-    return {
-        'operation_time_seconds'    : operation_time_seconds,
-        'existing_files'            : existing_files,
-    }
-
-
-
-def _set_unique_destination_filename( source_file, file_data, program_options, existing_destination_files,
-                                      destination_file_manifests ):
-    # Folder structure is YYYY\YY-MM-DD\[unique filename]
-    date_components = {
-        'year'          : str( file_data['timestamp'].year ),
-
-        # Can't we pull the date out of the timestmap and just ISO8601 this? I don't think we need to build our own
-        'date_iso8601'  : \
-            f"{file_data['timestamp'].year:4d}-{file_data['timestamp'].month:02d}-{file_data['timestamp'].day:02d}",
-    }
-
-    #print( f"\tTrying to find unique destination filename for {date_components['year']}\{date_components['date_iso8601']}\{source_file}")
-
-    #print( "Existing destination files:\n" + json.dumps(existing_destination_files, indent=4, sort_keys=True))
-
-    if date_components['year'] not in destination_file_manifests:
-        destination_file_manifests[ date_components['year']] = {}
-
-    if date_components['date_iso8601'] not in destination_file_manifests[ date_components['year'] ]:
-        destination_file_manifests[ date_components['year'] ][ date_components['date_iso8601']] = {}
-        #print( f"\t\tCreated destination file manifest entry for \"{date_components['year']}\{date_components['date_iso8601']}\"")
-
-    file_data['destination_subfolder'] = os.path.join( date_components['year'], date_components['date_iso8601'] )
-
-    manifest_for_this_file = destination_file_manifests[ date_components['year'] ][ date_components['date_iso8601']]
-    existing_destination_files_in_dir = []
-    if date_components['year'] in existing_destination_files and    \
-            date_components['date_iso8601'] in existing_destination_files[date_components['year']]:
-        for curr_existing_file in existing_destination_files[ date_components['year'] ][ date_components['date_iso8601']]:
-            # Get just the filename out
-            existing_destination_files_in_dir.append( os.path.basename( curr_existing_file) )
-    else:
-        print( "\tFound a file with a date not included in the existing destination files dictionary: " 
-               f"\"{date_components['year']}\{date_components['date_iso8601']}\"" )
-
-        print( "\tListing all entries in the existing destination files dictionary:")
-        for curr_year in sorted(existing_destination_files):
-            for curr_date in sorted(existing_destination_files[curr_year]):
-                print( f"\t\tFound year/date combo {curr_year}\{curr_date}" )
-
-        print("\tDone")
-
-    # print( f"Existing files in {date_components['year']}\{date_components['date_iso8601']}:\n" +
-    #     json.dumps( existing_destination_files_in_dir, indent=4, sort_keys=True) )
-
-    # Find first filename that doesn't exist in the given destination manifest
-    basename = os.path.basename( source_file )
-    (basename_minus_ext, file_extension) = os.path.splitext(basename)
-
-    test_filename = basename
-    index_append = 0
-
-    # If there is a pre-existing file with that name, or we're planning on creating a file with that name, find one that doesn't exist
-    while test_filename in existing_destination_files_in_dir or test_filename in manifest_for_this_file:
-        # Need to come up with a non-conflicting name
-        index_append += 1
-
-        next_attempt_name = f"{basename_minus_ext}_{index_append:04d}{file_extension}"
-
-        logging.info( f"Found destination filename conflict with \"{test_filename}\", trying \"{next_attempt_name}\"" )
-
-        test_filename = next_attempt_name
-
-    #print( f"\t\tFound unique destination filename: {date_components['year']}\{date_components['date_iso8601']}\{test_filename}")
-    # Mark the final location for this file
-    file_data[ 'unique_destination_file_path' ] = os.path.join( date_components['year'],
-                                                                date_components['date_iso8601'],
-                                                                test_filename )
-
-    # # Record the XMP filename for this destination file
-    # (filename_no_extension, filename_extension) = os.path.splitext( test_filename )
-    # file_data[ 'xmp' ] = {
-    #     'filename': os.path.join( date_components['year'],
-    #                               date_components['date_iso8601'],
-    #                               f"{filename_no_extension}.xmp" ),
-    # }
-
-    # Update destination manifest
-    manifest_for_this_file[ test_filename ] = file_data
-    # Replace the timestamp object with a ISO format string
-    #manifest_for_this_file[ test_filename ][ 'timestamp'] = \
-        #manifest_for_this_file[ test_filename ][ 'timestamp'].isoformat()
-
-    #logging.debug( f"Updated file info:\n{json.dumps(file_data, indent=4, sort_keys=True, default=str)}")
-
-
-def _set_destination_filenames( program_options, source_file_manifest, existing_destination_files ):
-
-    print( "\nDetermining unique filenames in destination folder")
-
-    #raise ValueError("Not actually detecting duplicates in destination directory anymore, what's up?")
-
-    start_time = time.perf_counter()
-
-    sorted_files = sorted(source_file_manifest.keys())
-
-    destination_file_manifests = {}
-
-    for curr_file in sorted_files:
-        logging.debug(f"Getting size and unique destination filename for {curr_file}")
-
-        _set_unique_destination_filename( curr_file, source_file_manifest[curr_file],
-            program_options, existing_destination_files, destination_file_manifests )
-
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
-
-    print( f"\tUnique filenames set for all {len(sorted_files)} destination image files" )
-
-    return {
-        "operation_time_seconds"        : operation_time_seconds,
-        'destination_file_manifests'    : destination_file_manifests,
-    }
-
-
-def _do_file_copies_to_laptop( program_options, source_file_manifest ):
-
-    print( f"\nCopying files from source \"{program_options['sourcedirs']['full']}\" to destination \"{program_options['laptop_destination_folder']}\"")
-
-    start_time = time.perf_counter()
-
-    file_count = len( source_file_manifest.keys() )
-
-    for curr_source_file in source_file_manifest:
-        # print( f"Worker {worker_index} doing copy for {curr_source_file}" )
-        curr_file_entry = source_file_manifest[curr_source_file]
-
-        # Do we need to make either of the subfolders (YYYY/YYYY-MM-DD)?
-        curr_folder = os.path.join( program_options['laptop_destination_folder'], curr_file_entry['destination_subfolder'] )
-        try:
-            pathlib.Path(curr_folder).mkdir(parents=True, exist_ok=True)
-        except:
-            print(f"Exception thrown in creating dirs for {curr_folder}")
-
-        # Remove the destination subfolder section out of the manifest, it's no longer needed
-        del curr_file_entry['destination_subfolder']
-
-        # Attempt copy
-        try:
-            dest_path = os.path.join( program_options['laptop_destination_folder'], curr_file_entry['unique_destination_file_path'] )
-            source_absolute_path = os.path.join( program_options['sourcedirs']['full'], curr_source_file)
-            shutil.copyfile(source_absolute_path, dest_path)
-            #print( f"\tCopied \"{source_absolute_path}\" -> \"{dest_path}\" successfully")
-
-        except:
-            print(f"Exception thrown when copying {curr_file_entry['unique_destionation_file_path']}")
-
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
-
-    print( "\tFile copies completed")
-
-    return {
-        "operation_time_seconds"        : operation_time_seconds,
-    }
-
-
-def _do_readback_validation( source_file_manifest, program_options ):
-    start_time = time.perf_counter()
-
-    global curr_processes_running
-
-    process_handles = []
-
-    #  Queue for sending files needing validation  to children
-    files_to_verify_queue = multiprocessing.Queue()
-
-    # Event object that parent uses so children know when to stop reading
-    parent_done_writing = multiprocessing.Event()
-
-    num_worker_processes = max_processes_running - curr_processes_running
-
-    for i in range(num_worker_processes):
-        process_handle = multiprocessing.Process( target=_validation_worker,
-                                                  args=(i+1, files_to_verify_queue, parent_done_writing) )
-        process_handle.start()
-        curr_processes_running += 1
-        #logging.debug(f"Parent back from start on child process {i+1}")
-        process_handles.append( process_handle )
-
-    # Load up the queue with all the files to process
-    for curr_file in source_file_manifest:
-        curr_file_info = source_file_manifest[curr_file]
-        validation_worker_data = {
-            'file_path'         : os.path.join( program_options['laptop_destination_folder'],
-                                                curr_file_info['unique_destination_file_path'] ),
-            'filesize_bytes'    : curr_file_info['filesize_bytes'],
-            'hashes'            : curr_file_info['hashes'],
+    # Create return list (only need relative paths)
+    file_dict = {}
+    total_file_bytes = 0
+    for curr_file_entry in source_file_lists[program_options['sourcedirs']['timestamps']]:
+        file_dict[ curr_file_entry['file_path']['relative']] = {
+            'filesize_bytes'    : curr_file_entry['filesize_bytes'],
+            'timestamp'         : curr_file_entry['timestamp']
         }
-        #print(f"About to write {json.dumps(validation_worker_data)} to the child queue")
-        files_to_verify_queue.put(validation_worker_data)
+        total_file_bytes += curr_file_entry['filesize_bytes']
 
-    parent_done_writing.set()
+    bytes_in_gb = 1024.0 * 1024.0 * 1024.0
+    total_file_gb = total_file_bytes / bytes_in_gb
 
-    # Just wait until all child processes rejoin
-    while process_handles:
-        curr_process = process_handles.pop()
-        curr_process.join()
-        curr_processes_running -= 1
-
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
+    print ( f"\tFound {total_file_count:,} \".{program_options['file_extension']}\" files totalling " +
+            f"{total_file_gb:.02f} GB")
 
     return {
-        "operation_time_seconds"    : operation_time_seconds,
+        # Only need to return one source file list, as they're all identical
+        'source_file_dict'  : file_dict,
+        'total_file_count'  : total_file_count,
+        'total_file_bytes'  : total_file_bytes
     }
 
 
-def _validation_worker( worker_index, files_to_verify_queue, parent_done_writing ):
-    while True:
-        try:
-            # No need to wait, the queue was pre-loaded by the parent
-            curr_file_entry = files_to_verify_queue.get(timeout=0.1)
-        except queue.Empty:
-            # is it because the parent is done writing?
-            if parent_done_writing.is_set():
-                break
+def _set_destination_filenames( program_options, source_image_info ):
+    print("\nDetermining unique filenames in destination storage directories")
+    destination_dir_prefix = program_options['destination_folders'][0]
 
-        #print( f"Child {worker_index} validating file {curr_file_entry['file_path']}")
+    # Resolve filename conflicts in the YYYY/YYYY-MM-DD destination dir
+    filename_conflicts_found = 0
+    for source_filename in source_image_info:
+        logging.debug( f"Determining unique destination filename for {source_filename}")
+        year = source_image_info[source_filename]['timestamp'].year
+        yearmonthday = source_image_info[source_filename]['timestamp'].isoformat()[:10]
 
-        #print( f"Full deets:\n" + json.dumps(curr_file_entry, indent=4, sort_keys=True) )
+        #print( f"Destination path: {destination_path}")
+        source_image_info[source_filename]['destination'] = {
+            'relative_directory'    : os.path.join( str(year), yearmonthday ),
+        }
 
-        with open( curr_file_entry['file_path'], "rb" ) as verify_file_handle:
-            file_bytes = verify_file_handle.read()
-            computed_digest = hashlib.sha3_512(file_bytes).hexdigest()
-            if computed_digest != curr_file_entry['hashes']['sha3_512']:
-                print( f"FATAL: file {curr_file_entry['file_path']} does not have expected hash from manifest")
-                #print( f"Before copy: {curr_file_entry['hashes']['sha3_512']}\n After copy: {computed_digest}")
+        # Check to see if relative path is clear
+        destination_path = os.path.join(destination_dir_prefix, str(year), yearmonthday, source_filename)
+
+        unique_extension = 1
+        if os.path.exists(destination_path):
+            filename_conflicts_found += 1
+            while os.path.exists(destination_path):
+                (filename_no_extension, filename_extension) = os.path.splitext( source_filename)
+                destination_path = os.path.join(destination_dir_prefix, str(year), yearmonthday,
+                                                f"{filename_no_extension}_{unique_extension:04d}{filename_extension}")
+                unique_extension += 1
+            source_image_info[source_filename]['destination']['unique_relative_destination_path'] = \
+                os.path.join(str(year), yearmonthday,
+                             f"{filename_no_extension}_{(unique_extension - 1):04d}{filename_extension}")
+        else:
+            source_image_info[source_filename]['destination']['unique_relative_destination_path'] = \
+                os.path.join( str(year), yearmonthday, source_filename )
+
+    #print( f"Updated source file info:\n{json.dumps(source_image_info, indent=4, sort_keys=True, default=str)}")
+
+    num_files = len(source_image_info)
+    #num_files = 4567
+    print( f"\t{num_files:6,} \".{program_options['file_extension']}\" file(s) have had their unique destination paths determined")
+    print( f"\t{filename_conflicts_found:6,} \".{program_options['file_extension']}\" file(s) had to have their destination paths updated due to existing files in the destination dir")
+
+
+def _create_destination_writer_queues( program_options ):
+    destination_writer_queues = []
+    for curr_destination_folder in range(len(program_options['destination_folders'])):
+        destination_writer_queues.append( multiprocessing.SimpleQueue() )
+
+    return destination_writer_queues
+
+
+def _write_to_destination_folder_worker( pipe_read_connection, destination_folder,
+                                         number_of_sourcedirs,
+                                         display_console_messages_queue,
+                                         checksum_update_queue):
+
+    worker_starting_msg = {
+        "msg_level"         : logging.DEBUG,
+        "msg"               : f"Worker process to write data to \"{destination_folder}\" has started",
+    }
+
+    display_console_messages_queue.put( worker_starting_msg )
+
+    # Keep track of what files this destination writer has decided to write to disk
+    files_being_written_to_disk = {}
+
+    # Read out of pipe until it's closed
+    sourcedirs_still_writing = number_of_sourcedirs
+    while ( sourcedirs_still_writing > 0 ):
+        data_received = pipe_read_connection.get()
+
+        # See if it's a "done writing" message
+        if data_received['message_type'] == "DONE_WRITING":
+            sourcedirs_still_writing -= 1
+            ending_write_msg = {
+                "msg_level"     : logging.DEBUG,
+                "msg"           : f"Destination writer for {destination_folder} got DONE_WRITING msg " + \
+                    f"from sourcedir {data_received['sourcedir']}"
+            }
+            display_console_messages_queue.put(ending_write_msg)
+        elif data_received['message_type'] == "DATA_BLOCK":
+
+
+            #formulated_path = os.path.join( destination_folder, data_received['relative_path'])
+            relative_path = data_received['file_info']['relative_path']
+            relative_dir = data_received['file_info']['relative_dir']
+            sourcedir = data_received['file_info']['sourcedir']
+            byte_start = data_received['data_block']['block_byte_start']
+            payload_len = data_received['data_block']['block_num_bytes']
+            byte_end = data_received['data_block']['block_byte_end']
+            total_file_size = data_received['file_info']['total_file_size']
+            file_payload = data_received['data_block']['block_payload']
+
+            # Let's see if we're going to write this update to disk or just ignore it
+            if relative_path not in files_being_written_to_disk:
+                # We're definitely going to write this bad boy to disk
+                write_block_to_disk = True
+
+                # Record the relevant info so we know if it's a duplicate or not
+                files_being_written_to_disk[ relative_path ] = {
+                    'sourcedir' : sourcedir
+                }
+            # As long as the sourcedir matches the one we're writing, we'll act on the write request
+            elif files_being_written_to_disk[relative_path]['sourcedir'] == sourcedir:
+                write_block_to_disk = True
+
+            # This write came from a different sourcedir, so just politely but firmly discard the request
             else:
-                #print( f"{curr_file_entry['file_path']} passed its verify hash check ({curr_file_entry['hashes']['sha3_512']})")
-                pass
+                write_block_to_disk = False
 
-    # Okay to just cleanly fall out and exit
+            if write_block_to_disk:
 
+                #print( f"\n *** Destination absolute path created by joining folder {destination_folder} and path {relative_path}")
 
-def _create_xmp_files( destination_file_manifests, program_options ):
-    start_time = time.perf_counter()
+                destination_absolute_path = os.path.join(destination_folder, relative_path)
 
-    global curr_processes_running
+                # Is this the first data block for the file?
+                if byte_start == 1:
+                    # Create missing directories along the path, if any
+                    destination_dir_absolute_path = os.path.join( destination_folder, relative_dir)
+                    if os.path.isdir( destination_dir_absolute_path ) is False:
+                        os.makedirs( destination_dir_absolute_path )
 
-    #  Queue for sending files needing XMP files children
-    xmp_file_queue = multiprocessing.Queue()
+                    # Open for write (create) in binary mode
+                    open_flags = "wb"
 
-    parent_done_writing = multiprocessing.Event()
+                    # Sanity check because some weird shit is happening
+                    assert os.path.isfile(destination_absolute_path) is False, \
+                            f"Going to try to write to {destination_absolute_path} for the first time, but the file existed"
+                else:
+                    # Open for append in binary mode
+                    open_flags = "ab"
 
-    #print( f"Destination manifests: {json.dumps(destination_file_manifests, indent=4, sort_keys=True, default=str)}" )
+                    assert os.path.isfile(destination_absolute_path), \
+                            f"Was going to append to {destination_absolute_path} but the file doesn't exist"
 
-    images_written_to_queue = 0
-
-    process_handles = []
-
-    num_worker_processes = max_processes_running - curr_processes_running
-
-    # Fire up the child processes
-    for i in range(num_worker_processes):
-    #for i in range(1):
-        process_handle = multiprocessing.Process( target=_xmp_creation_worker,
-                                                  args=(i+1, xmp_file_queue, parent_done_writing, program_options ) )
-        process_handle.start()
-        curr_processes_running += 1
-        #logging.debug(f"Parent back from start on child process {i+1}")
-        process_handles.append( process_handle )
-
-    for curr_year_folder in sorted( destination_file_manifests ):
-        for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
-            curr_manifest = destination_file_manifests[ curr_year_folder ][ curr_date_folder ]
-            #print( f"Processing manifest for {curr_date_folder}" )
-            for curr_manifest_filename in sorted( curr_manifest ):
-                xmp_file_queue.put(
-                    {
-                        'year'                  : curr_year_folder,
-                        'date'                  : curr_date_folder,
-                        'filename'              : curr_manifest_filename,
-                        'xmp_generation_info'   : curr_manifest[curr_manifest_filename],
-                    }
-                )
-                images_written_to_queue += 1
-
-    parent_done_writing.set()
-
-
-    # Wait for all child processes to re-join with parent
-    while process_handles:
-        curr_handle = process_handles.pop()
-        curr_handle.join()
-        curr_processes_running -= 1
-
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
-
-    return {
-        "operation_time_seconds"    : operation_time_seconds,
-    }
-
-
-def _do_xmp_cleanup_canon_rf_24_105_lens_id( generated_xmp_file ):
-    # ExifTool creates the following section in the XMP for a Canon RF 24-105 f4-7.1 IS STM lens:
-    #
-    #  <rdf:Description rdf:about=''
-    #   xmlns:aux='http://ns.adobe.com/exif/1.0/aux/'>
-    #   <aux:Lens>24.0 - 105.0 mm</aux:Lens>
-    #  </rdf:Description>
-    #
-    # That is parsed very poorly by Lightroom, and it tags the Lens as "24," which doesn't look good in
-    #   Lightroom and would look even worse in Flickr
-    with open( generated_xmp_file, "r") as xmp_handle:
-        xmp_contents = xmp_handle.read()
-
-    # See if we have a Canon EOS R5 with that lens before making any changes
-    identifying_aux_section_string = " <rdf:Description rdf:about=''\n" + \
-        "  xmlns:aux='http://ns.adobe.com/exif/1.0/aux/'>\n" + \
-        "  <aux:Lens>24</aux:Lens>\n" + \
-        "  <aux:LensID>61182</aux:LensID>\n" + \
-        " </rdf:Description>"
-    identifying_strings = [
-        "<tiff:Model>Canon EOS R5</tiff:Model>",
-        identifying_aux_section_string,
-    ]
-
-    if all( curr_identifying_string in xmp_contents for curr_identifying_string in identifying_strings ):
-        #print( f"File {generated_xmp_file} is from a Canon EOS R5 with RF 24-105mm f/4-7.1 IS STM lens")
-
-        replaced_aux_section_string = """ <rdf:Description rdf:about=''
-  xmlns:aux='http://ns.adobe.com/exif/1.0/aux/'>
-  <aux:Lens>RF24-105mm F4-7.1 IS STM</aux:Lens>
-  <aux:LensInfo>24/1 105/1 0/0 0/0</aux:LensInfo>
-  <aux:LensID>61182</aux:LensID>
- </rdf:Description>"""
-
-        # Open the XMP up and replace the aux section entirely
-        with open( generated_xmp_file, "w") as fixed_handle:
-            fixed_handle.write( xmp_contents.replace(identifying_aux_section_string, replaced_aux_section_string))
-
-    else:
-        #print(f"File {generated_xmp_file} is NOT from a Canon EOS R5 with RF 24-105mm f/4-7.1 IS STM lens")
-        #print( "XMP Contents:\n" + xmp_contents)
-        pass
-
-
-def _cleanup_xmp( generated_xmp_file ):
-    _do_xmp_cleanup_canon_rf_24_105_lens_id( generated_xmp_file )
-
-
-def _xmp_creation_worker( worker_index, files_to_create_xmp_files_queue, parent_done_writing, program_options ):
-    gpx_wildcard = os.path.join(program_options['gpx_file_folder'], "*.gpx")
-
-    with exiftool.ExifTool() as exiftool_handle:
-        while True:
-            try:
-                # No need to wait, the queue was pre-loaded by the parent
-                curr_image_to_create_xmp_for = files_to_create_xmp_files_queue.get( timeout=0.1 )
-            except queue.Empty:
-                if parent_done_writing.is_set():
+                try:
+                    with open( destination_absolute_path, open_flags ) as file_handle:
+                        file_handle.write( file_payload )
+                except:
+                    print( f"Error hit when opening/writing {destination_absolute_path} with flags {open_flags}")
                     break
 
-            #print( "Child asked to create XMP for:\n" + json.dumps( curr_image_to_create_xmp_for, indent=4, sort_keys=True,
-            #                                                default=str))
+                # display_message = f"Destination writer for {destination_folder} got data block from {sourcedir} for {relative_path}, starting at byte {byte_start}, len={payload_len}, ending byte={byte_end}, total file size={total_file_size}"
+                # writing_data_msg = {
+                #     "msg_level"     : logging.DEBUG,
+                #     "msg"           : display_message,
+                # }
+                # display_console_messages_queue.put( writing_data_msg)
 
-            raw_file_absolute_path = os.path.join(program_options['laptop_destination_folder'],
-                                                  curr_image_to_create_xmp_for['xmp_generation_info']['unique_destination_file_path'] )
+                # If this is the last block we wrote out, note that the file we just finished writing needs
+                #       checksumming
+                if byte_end == total_file_size:
+                    checksum_msg = {
+                        'file_info': {
+                            'absolute_path' : destination_absolute_path,
+                            'relative_path' : relative_path,
+                        }
+                    }
 
-            (filename_no_extension, filename_extension) = os.path.splitext( raw_file_absolute_path )
+                    checksum_update_queue.put( checksum_msg)
 
-            expected_xmp_file = os.path.join( program_options['laptop_destination_folder'],
-                                              curr_image_to_create_xmp_for['year'],
-                                              curr_image_to_create_xmp_for['date'], f"{filename_no_extension}.xmp" )
+            file_payload = None
+            del data_received['data_block']['block_payload']
 
-            exiftool_parameters= (
-                # Point it towards the RAW file we want an XMP file for
-                exiftool.fsencode(raw_file_absolute_path),
+        data_received = None
 
-                # Specify output to XMP. I'm not sure how it figured out it shoulduse XMP. Is -o automatically XMP?
-                #   No, exiftool extracts type of output by extension given to the OUTFILE parameter
-                "-o".encode(),
-                "%d%f.xmp".encode(),
-            )
+    worker_exiting_msg = {
+        "msg_level"     : logging.DEBUG,
+        "msg"           : f"Destination writer for {destination_folder} exiting cleanly"
+    }
 
-            #print("Running EXIFTool XMP generation command")
-            execute_output = exiftool_handle.execute( *exiftool_parameters )
-            #print("Back from EXIFTool")
-
-            # Do any necessary cleanup to the newly-generated XMP file to make for cleaner import
-            #   into Lightroom (e.g., fixing a lens identifier for Canon RF 24-105mm f/4-7.1 IS STM)
-            _cleanup_xmp( expected_xmp_file )
-
-            # Now adding geotags to the XMP file -- note we're making the first-stage XMP our source,
-            #   not the RAW image -- we don't want to write tags to the RAW file, just the XMP
-            exiftool_params = (
-                #"-v2".encode(),
-                "-geotag".encode(),
-                gpx_wildcard.encode(),
-                "-geotime<${DateTimeOriginal}+00:00".encode(),
-                exiftool.fsencode( expected_xmp_file ),
-                "-o".encode(),
-                "%d%f_geocode.xmp".encode(),
-            )
-
-            execute_output = exiftool_handle.execute(*exiftool_params)
-            #print(f"\t\tGeotagged into {basename_minus_ext}_geocode.xmp\n")
-            #print( f"Output:{execute_output.decode()}")
-
-            # Now overwrite the first XMP file with the geotagged version
-            geocoded_xmp_path = os.path.join( program_options['laptop_destination_folder'],
-                                              curr_image_to_create_xmp_for['year'],
-                                              curr_image_to_create_xmp_for['date'],
-                                              f"{filename_no_extension}_geocode.xmp" )
-
-            shutil.move( geocoded_xmp_path, expected_xmp_file )
+    display_console_messages_queue.put(worker_exiting_msg)
 
 
-    #print( "Child exiting cleanly")
+def _launch_destination_writers(program_options, display_console_messages_queue, checksum_update_queue ):
+    destination_writer_queues = _create_destination_writer_queues(program_options)
+
+    writer_process_handles = []
+
+    number_of_sourcedirs = 1 + len(program_options['sourcedirs']['additional'])
+
+    # Create processes to write to each destination
+    for (i, curr_dest_folder) in enumerate(program_options['destination_folders']):
+        curr_handle = multiprocessing.Process(target=_write_to_destination_folder_worker,
+                                              args=( destination_writer_queues[i],
+                                                     curr_dest_folder,
+                                                     number_of_sourcedirs,
+                                                     display_console_messages_queue,
+                                                     checksum_update_queue) )
+
+        writer_process_handles.append( curr_handle )
+        curr_handle.start()
+
+    return_dict = {
+        "writer_queues"             : destination_writer_queues,
+        "writer_process_handles"    : writer_process_handles,
+    }
+
+    return return_dict
 
 
-def _copy_to_external_storage_worker( program_options, curr_travel_storage_media_folder, source_file_manifest):
-    print( f"\tCreating travel media storage copy at \"{curr_travel_storage_media_folder}\"" )
-    shutil.copytree( program_options['laptop_destination_folder'], curr_travel_storage_media_folder,
-                     dirs_exist_ok=True)
-    print( f"\tTravel media storage copy \"{curr_travel_storage_media_folder}\" created successfully")
+def _read_from_sourcedir_worker( curr_sourcedir, source_image_info,
+                                 display_console_messages_queue, destination_writer_queues,
+                                 checksum_update_queue):
 
+    worker_starting_msg = {
+        "msg_level"         : logging.DEBUG,
+        "msg"               : f"Worker process to read data from sourcedir \"{curr_sourcedir}\" has started",
+    }
 
-def _copy_files_to_external_storage( program_options, source_file_manifest ):
-    print( "\nCopying staged files from laptop NVMe to external storage travel media")
+    display_console_messages_queue.put( worker_starting_msg )
 
-    global curr_processes_running
+    # Max block size = 1MB
+    max_block_size = 1024 * 1024
 
-    start_time = time.perf_counter()
-    process_handles = []
-    #print( "Program options: " + json.dumps(program_options, indent=4, sort_keys=True) )
-    for curr_travel_storage_media_folder in program_options['travel_storage_media_folders']:
+    for curr_input_file in source_image_info:
+        curr_input_file_data = source_image_info[curr_input_file]
+        #print( "Input file:\n" + json.dumps(curr_input_file_data, indent=4, sort_keys=True, default=str))
 
-        copy_process_handle = multiprocessing.Process(target=_copy_to_external_storage_worker,
-                                             args=(program_options,
-                                                   curr_travel_storage_media_folder,
-                                                   source_file_manifest))
-        copy_process_handle.start()
-        curr_processes_running += 1
-        #print(f"\tStarted copy of staged files to external travel storage media folder \"{curr_travel_storage_media_folder}\" ")
+        # Loop over block-sized chunks in the file
+        curr_file_offset = 0
+        sourcefile_absolute_path = os.path.join( curr_sourcedir, curr_input_file )
+        curr_file_size = os.path.getsize(sourcefile_absolute_path)
+        #print( f"Sourcefile {sourcefile_absolute_path} has file size of {curr_file_size} bytes")
+        with open( sourcefile_absolute_path, "rb") as file_handle:
+            while curr_file_offset + 1 < curr_file_size:
+                bytes_for_block = min( curr_file_size - curr_file_offset, max_block_size )
+                #print( f"Bytes for block: {bytes_for_block}")
 
-        process_handles.append(copy_process_handle)
+                data_block_payload_bytes = file_handle.read(bytes_for_block)
 
-    while process_handles:
-        curr_join_handle = process_handles.pop()
-        curr_join_handle.join()
-        curr_processes_running -= 1
-    #print("\tAll copy processes have finished and rejoined with parent")
-
-    print( "\tAll copies to travel media complete")
-
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
-
-    return operation_time_seconds
-
-
-
-
-def _update_manifest_with_geotags( program_options, destination_file_manifests ):
-    start_time = time.perf_counter()
-
-    for curr_year_folder in sorted( destination_file_manifests ):
-        for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
-            for curr_manifest_filename in sorted( destination_file_manifests[ curr_year_folder ][curr_date_folder] ):
-
-                curr_manifest_entry = destination_file_manifests[curr_year_folder][curr_date_folder][curr_manifest_filename]
-                xmp_path = os.path.join(program_options['laptop_destination_folder'],
-                                        curr_manifest_entry['xmp']['filename'])
-
-                # Pull the geotags out of the XMP file
-                xmp_tree = xml.etree.ElementTree.parse(xmp_path)
-                root = xmp_tree.getroot()
-
-                xml_namespaces = {
-                    'exif'  : 'http://ns.adobe.com/exif/1.0/',
+                # Write the data block for checksumming
+                checksum_update_request_msg = {
+                    'file_info'     : {
+                        'absolute_path'     : sourcefile_absolute_path,
+                        'relative_path'     : curr_input_file_data['destination']['unique_relative_destination_path'],
+                        'total_file_size'   : curr_file_size,
+                    },
+                    'data_block'    : {
+                        "block_byte_start"  : curr_file_offset + 1,
+                        "block_num_bytes"   : bytes_for_block,
+                        "block_byte_end"    : curr_file_offset + bytes_for_block,
+                        "block_payload"     : data_block_payload_bytes,
+                    },
                 }
-                gps_alt = root.find( ".//exif:GPSAltitude", xml_namespaces)
-                gps_lat = root.find( ".//exif:GPSLatitude", xml_namespaces)
-                gps_lon = root.find( ".//exif:GPSLongitude", xml_namespaces )
 
-                # Make readable versions of the geotag data, as it's... not great
-                (alt_numerator, alt_denominator) = gps_alt.text.split( "/" )
-                alt_numerator = int( alt_numerator )
-                alt_denominator = int( alt_denominator )
+                checksum_update_queue.put( checksum_update_request_msg )
 
-                latitude_hemisphere = gps_lat.text[-1]
-                if latitude_hemisphere == "N":
-                    latitude_multiplier = 1
-                elif latitude_hemisphere == "S":
-                    latitude_multiplier = -1
-                else:
-                    raise ValueError("Invalid latitude hemisphere, neither N nor S")
-
-                (lat_degrees, lat_minutes) = gps_lat.text.split( ",")
-                readable_lat = latitude_multiplier * (int(lat_degrees) + (float(lat_minutes[:-1]) / 60.0))
-
-                longitude_hemisphere = gps_lon.text[-1]
-                if longitude_hemisphere == "W":
-                    longitude_multiplier = -1
-                elif longitude_hemisphere == "E":
-                    longitude_multiplier = 1
-                else:
-                    raise ValueError("Invalid longitude hemisphere, neither W nor E")
-                (lon_degrees, lon_minutes) = gps_lon.text.split(",")
-                readable_lon = longitude_multiplier * (int(lon_degrees) + (float(lon_minutes[:-1]) / 60.0))
-
-                curr_manifest_entry[ 'geotag_info'] = {
-                    'latitude'  : {
-                        'value'     : str(round(readable_lat, 6)),
-                        'unit'      : "WGS84 degrees",
+                data_block_msg = {
+                    'message_type'  : "DATA_BLOCK",
+                    'file_info'     : {
+                        'sourcedir'         : curr_sourcedir,
+                        'relative_path'     : curr_input_file_data['destination']['unique_relative_destination_path'],
+                        'total_file_size'   : curr_file_size,
+                        'relative_dir'      : curr_input_file_data['destination']['relative_directory'],
                     },
-                    'longitude' : {
-                        'value'     : str(round(readable_lon, 6)),
-                        'unit'      : "WGS84 degrees",
-                    },
-                    'altitude'  : {
-                        'value'     : str(round(alt_numerator / alt_denominator, 2)),
-                        'unit'      : 'meters above sea level',
+                    "data_block": {
+                        "block_byte_start"  : curr_file_offset + 1,
+                        "block_num_bytes"   : bytes_for_block,
+                        "block_byte_end"    : curr_file_offset + bytes_for_block,
+                        "block_payload"     : data_block_payload_bytes,
                     }
                 }
 
-                # Create a hash of the XMP file and store it in the manifest
+                # Write the block to all destinations
+                for curr_writer_queue in destination_writer_queues:
+                    curr_writer_queue.put(data_block_msg)
 
-                with open(xmp_path, "rb") as xmp_file_handle:
-                    file_bytes = xmp_file_handle.read()
-                    computed_digest = hashlib.sha3_512(file_bytes).hexdigest()
-                    curr_manifest_entry['xmp']['sha3_512'] = computed_digest
+                # Drop the bytes as quickly as we can
+                data_block_payload_bytes = None
+                del data_block_msg['data_block']['block_payload']
+                data_block_msg = None
 
-                #print( f"Updated manifest entry for {curr_year_folder}\{curr_date_folder}\{curr_manifest_filename}:")
-                #print( json.dumps(curr_manifest_entry, indent=4, sort_keys=True, default=str) )
+                #print( "Wrote following block to all destinations:\n" + json.dumps(data_block_msg, indent=4, sort_keys=True, default=str))
 
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
+                curr_file_offset += bytes_for_block
 
-    return {
-        'operation_time_seconds': operation_time_seconds,
+    done_writing_msg = {
+        "sourcedir"     : curr_sourcedir,
+        "message_type"  : "DONE_WRITING",
     }
 
-def _write_manifest_files( program_options, destination_file_manifests ):
-    start_time = time.perf_counter()
+    for curr_writer_queue in destination_writer_queues:
+        curr_writer_queue.put( done_writing_msg )
 
-    for curr_year_folder in sorted( destination_file_manifests ):
-        for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
-            curr_day_manifest = destination_file_manifests[curr_year_folder][curr_date_folder]
-
-            # See if there's an existing manifest for that date, if so, read it in and merge it with our manifest
-            target_manifest_path = os.path.join( program_options['laptop_destination_folder'],
-                                             curr_year_folder,
-                                             curr_date_folder,
-                                             f"tdo_photo_manifest_{curr_date_folder}.json" )
-            if os.path.isfile( target_manifest_path ):
-                with open( target_manifest_path, "r") as existing_manifest_handle:
-                    existing_manifest = json.load( existing_manifest_handle )
-                write_manifest = copy.deepcopy( curr_day_manifest )
-                write_manifest.update( existing_manifest )
-            else:
-                write_manifest = curr_day_manifest
-
-            with open( target_manifest_path, "w" ) as new_or_updated_manifest_handle:
-                json.dump( write_manifest, new_or_updated_manifest_handle, indent=4, sort_keys=True,
-                           default=str)
-
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
-
-    return {
-        'operation_time_seconds': operation_time_seconds,
+    worker_terminating_msg = {
+        "msg_level"         : logging.DEBUG,
+        "msg"               : f"Worker process to read data from sourcedir \"{curr_sourcedir}\" exiting cleanly",
     }
 
-
-def _verify_travel_media_file_worker( worker_num, program_options, hash_verification_queue,
-                                      hash_checked_queue, parent_done_writing ):
-    queue_timeout = 0.1
-
-    while True:
-        try:
-            file_to_verify_entry = hash_verification_queue.get(timeout=queue_timeout)
-        except queue.Empty:
-            if parent_done_writing.is_set():
-                break
-            else:
-                continue
-
-        file_path = file_to_verify_entry['absolute_path']
-        with open( file_path, "rb") as file_handle:
-            file_bytes = file_handle.read()
-
-        #print( f"Child {worker_index} got file info:\n{json.dumps(curr_file_entry, indent=4, sort_keys=True)}")
-
-        computed_hashes = {
-            #"sha3_384"  :   hashlib.sha3_384(file_bytes).hexdigest(),
-            "sha3_512"  :   hashlib.sha3_512(file_bytes).hexdigest(),
-        }
-
-        #print( f"{curr_file_entry['absolute_path']}: {computed_hashes['sha3_512']}")
-
-        hash_checked_queue.put(
-            {
-                "absolute_path"     : file_path,
-                "hash_correct"      : computed_hashes == file_to_verify_entry['hashes'],
-            }
-        )
-
-        #print( f"\tWorker sent results for {file_path} back to parent")
-
-        # Release our reference to the file entry
-        file_to_verify_entry = None
-        file_bytes = None
-
-    # If we break out of the loop, we're exiting normally
+    display_console_messages_queue.put( worker_terminating_msg )
 
 
-def _verify_travel_media_copies( program_options, destination_file_manifests ):
-    start_time = time.perf_counter()
+def _launch_sourcedir_readers( program_options, source_image_info, display_console_messages_queue,
+                               destination_writers,
+                               checksum_update_queue ):
 
-    global curr_processes_running
+    reader_process_handles = []
+    #print( f"Destination writers:\n{json.dumps(destination_writers, indent=4, sort_keys=True, default=str)}")
+    all_sourcedirs = [ program_options['sourcedirs']['timestamps'], ]
 
-    # Queue that parent writes files needing validation to children
-    hash_verification_queue = multiprocessing.Queue()
+    for curr_additional_dir in program_options['sourcedirs']['additional']:
+        all_sourcedirs.append( curr_additional_dir)
 
-    # Queue that children use to write results of file verification scan back to parent
-    hash_checked_queue = multiprocessing.Queue()
+    for ( i, curr_sourcedir ) in enumerate( all_sourcedirs):
+        curr_handle = multiprocessing.Process( target=_read_from_sourcedir_worker,
+                                               args=(curr_sourcedir, source_image_info['source_file_dict'],
+                                                     display_console_messages_queue,
+                                                     destination_writers['writer_queues'],
+                                                     checksum_update_queue) )
+        reader_process_handles.append( curr_handle )
+        curr_handle.start()
 
-    parent_done_writing = multiprocessing.Event()
+    return reader_process_handles
 
-    process_handles = []
 
-    num_worker_processes = max_processes_running - curr_processes_running
+def _print_io_stats ( source_image_info, time_copy_checksum_seconds, number_of_copies_read,
+                      number_of_copies_written ):
 
-    #print( "Program options: " + json.dumps(program_options, indent=4, sort_keys=True) )
-    for i in range(num_worker_processes):
+    bytes_in_gb = 1024.0 * 1024.0 * 1024.0
+    gb_per_copy = source_image_info['total_file_bytes'] / bytes_in_gb
 
-        verify_process_handle = multiprocessing.Process(target=_verify_travel_media_file_worker,
-                                             args=(i+1, program_options,
-                                                   hash_verification_queue,
-                                                   hash_checked_queue, parent_done_writing))
-        verify_process_handle.start()
-        curr_processes_running += 1
+    gb_read = gb_per_copy * number_of_copies_read
+    read_speed = gb_read / time_copy_checksum_seconds
 
-        process_handles.append(verify_process_handle)
+    gb_written = gb_per_copy * number_of_copies_written
+    write_speed = gb_written / time_copy_checksum_seconds
 
-    files_to_verify_list = []
-    count_verify_checks_remaining = 0
+    total_gb = gb_read + gb_written
+    total_speed = total_gb / time_copy_checksum_seconds
 
-    for curr_year_folder in sorted( destination_file_manifests ):
-        for curr_date_folder in sorted( destination_file_manifests[ curr_year_folder ] ):
-            for curr_manifest_filename in sorted( destination_file_manifests[ curr_year_folder ][curr_date_folder] ):
+    print( "\nIO stats:")
 
-                curr_manifest_entry = destination_file_manifests[curr_year_folder][curr_date_folder][curr_manifest_filename]
-
-                for curr_travel_media_folder in program_options['travel_storage_media_folders']:
-                    files_to_verify_list.append(
-                        {
-                            'absolute_path'     : os.path.join( curr_travel_media_folder,
-                                                           curr_year_folder,
-                                                           curr_date_folder,
-                                                           curr_manifest_filename ),
-
-                            'hashes'            : curr_manifest_entry['hashes'],
-                        }
-                    )
-                    count_verify_checks_remaining += 1
-
-                    # Not creating XMP files, so don't worry about them
-                    # files_to_verify_list.append(
-                    #     {
-                    #         'absolute_path': os.path.join(curr_travel_media_folder,
-                    #                                       curr_manifest_entry['xmp']['filename'] ),
-                    #
-                    #         'hashes': {
-                    #             'sha3_512': curr_manifest_entry['xmp']['sha3_512']
-                    #         },
-                    #     }
-                    # )
-                    #
-                    # count_verify_checks_remaining += 1
-
-    # Loop through files to send out, alternating with reading all results out of queue
-    while files_to_verify_list or count_verify_checks_remaining > 0:
-        # Find out how many entries to write to children
-        entries_to_send = min( len(files_to_verify_list), num_worker_processes )
-
-        for i in range( entries_to_send ):
-            curr_entry_to_send = files_to_verify_list.pop()
-            hash_verification_queue.put( curr_entry_to_send )
-            #print( f"Parent sent {curr_entry_to_send['absolute_path']} to verify queue")
-            if len(files_to_verify_list) == 0:
-                parent_done_writing.set()
-                #print( "Parent marked done on sending data")
-
-        while True:
-            try:
-                child_result = hash_checked_queue.get_nowait()
-            except queue.Empty:
-                break
-
-            if child_result['hash_correct'] is False:
-                print( f"ERROR: hash check failed for {child_result['absolute_path']}")
-            count_verify_checks_remaining -= 1
-
-    while process_handles:
-        curr_rejoin_handle = process_handles.pop()
-        curr_rejoin_handle.join()
-        curr_processes_running -= 1
-
-    #print( "\tAll children have rejoined, checks complete")
-
-    end_time = time.perf_counter()
-    operation_time_seconds = end_time - start_time
-
-    return operation_time_seconds
-
+    #print( f"\tGB per copy: {gb_per_copy:,.02f}")
+    print( f"\t   Total RAW picture data read (checksumming/copying): {gb_read:8,.02f} GB ({read_speed:4.02f} GB/s)")
+    print( f"\tTotal RAW picture data written (creating file copies): {gb_written:8,.02f} GB ({write_speed:4.02f} GB/s)")
+    print( f"\t                                             Total IO: {total_gb:8,.02f} GB ({total_speed:4.02f} GB/s)")
 
 def _main():
     args = _parse_args()
@@ -1271,102 +643,123 @@ def _main():
         log_level = logging.INFO
     else:
         log_level = logging.DEBUG
-    logging.basicConfig( filename=args.logfile, level=log_level )
-    #logging.basicConfig(level=log_level)
 
-    program_options['sourcedirs'] = {
-        'full'      : args.sourcedir_full,
-        'partial'   : args.sourcedir_partial,
-    }
+    logging.basicConfig(level=log_level)
 
-    program_options['file_extension'] = args.fileext.lower()
-    program_options['file_timestamp_utc_offset_hours'] = args.file_timestamp_utc_offset_hours
-#    program_options['gpx_file_folder'] = args.gpx_file_folder
-    program_options['laptop_destination_folder'] = args.laptop_destination_folder
-    program_options['travel_storage_media_folders'] = args.travel_storage_media_folder
+    program_options['sourcedirs'] = {}
+    if args.additional_sourcedir:
+        program_options['sourcedirs']['additional'] = sorted(args.additional_sourcedir)
+    else:
+        program_options['sourcedirs']['additional'] = []
+
+    program_options['sourcedirs']['timestamps'] = args.timestamps_sourcedir
+
+    program_options['file_extension'] = args.raw_file_fileext.lower()
+    program_options['timestamp_utc_offset_hours'] = args.timestamp_utc_offset_hours
+    program_options['destination_folders'] = args.travel_storage_media_folder
+    program_options['checksum_processes'] = args.checksum_processes
+    program_options['checksum_queue_length'] = args.checksum_queue_length
 
     logging.debug( f"Program options: {json.dumps(program_options, indent=4, sort_keys=True)}" )
 
-    perf_timer = performance_timer.PerformanceTimer()
+    perftimer = performance_timer.PerformanceTimer()
+    time_start = time.perf_counter()
+    source_file_lists = _enumerate_source_images(program_options)
+    time_end = time.perf_counter()
+    perftimer.add_perf_timing( "Enumerate source images", time_end - time_start)
+    #print( "\nSource file info:\n" + json.dumps(source_image_info['source_file_dict'],
+    #                                                             indent=4, sort_keys=True, default=str) )
 
-    source_image_info = _enumerate_source_images(program_options)
-    perf_timer.add_perf_timing( 'Enumerating source images', source_image_info['operation_time_seconds'])
+    time_start = time.perf_counter()
+    _extract_exif_timestamps( source_file_lists, program_options )
+    time_end = time.perf_counter()
+    perftimer.add_perf_timing( "Extract EXIF timestamps", time_end - time_start)
 
-    #print( "File list to create source manifest:\n" + json.dumps(source_image_info['file_list'], indent=4, sort_keys=True) )
-    #print( "Reverse map for hashing:\n" + json.dumps(source_image_info['reverse_map'], indent=4) )
+    time_start = time.perf_counter()
+    source_image_info = _validate_sourcedir_lists_match(program_options, source_file_lists )
+    time_end = time.perf_counter()
+    perftimer.add_perf_timing( "Validate all sourcedir lists match", time_end - time_start)
 
-    manifest_info = _generate_source_manifest( source_image_info['reverse_map'],
-                                               source_image_info['source_file_list'] )
-    # Delete the reverse map, don't need it anymore
-    del source_image_info['reverse_map']
-    perf_timer.add_perf_timing(  'Creating source image manifest', manifest_info['operation_time_seconds'])
-    source_file_manifest = manifest_info['source_manifest']
 
-    # Get timestamp for all image files
-    timestamp_output = _extract_image_timestamps( program_options, source_file_manifest )
-    perf_timer.add_perf_timing( 'Extracting EXIF timestamps', timestamp_output['operation_time_seconds'])
-
-    # Enumerate files already in the destination directory
-    destination_files_results = _get_existing_files_in_destination( source_file_manifest, program_options )
-    perf_timer.add_perf_timing( "Listing existing files in destination folder",
-                                destination_files_results['operation_time_seconds'] )
-    existing_destination_files = destination_files_results['existing_files']
+    #print( "Source image info:\n" + json.dumps(source_image_info, indent=4, sort_keys=True, default=str))
 
     # Determine unique filenames
-    set_destination_filenames_results = _set_destination_filenames( program_options, source_file_manifest,
-                                                                    existing_destination_files )
-    perf_timer.add_perf_timing( 'Generating unique destination filenames',
-                      set_destination_filenames_results['operation_time_seconds'] )
-    destination_file_manifests = set_destination_filenames_results['destination_file_manifests']
+    time_start = time.perf_counter()
+    _set_destination_filenames( program_options, source_image_info['source_file_dict'] )
+    time_end = time.perf_counter()
+    perftimer.add_perf_timing( "Determine unique destination filenames", time_end - time_start)
 
-    # Do file copies to laptop NVMe SSD
-    copy_operation_results = _do_file_copies_to_laptop(program_options, source_file_manifest)
-    perf_timer.add_perf_timing( 'Copying RAW files to laptop NVMe',
-                     copy_operation_results['operation_time_seconds'])
 
-    # Do readback validation to make sure all writes to laptop worked
-    print("\nReading files back from laptop SSD to verify contents still match original hash")
-    verify_operation_results = _do_readback_validation( source_file_manifest, program_options )
-    print( "\tDone")
-    perf_timer.add_perf_timing( 'Validating all writes to laptop NVMe SSD are still byte-identical to source',
-        verify_operation_results['operation_time_seconds'])
+    # Create queue that all children use to send messages for display back up to parent
+    display_console_messages_queue = multiprocessing.Queue()
 
-    # Create XMP sidecar files
-#    print("\nCreating geotagged XMP sidecar files for all RAW images")
-#    xmp_generation_results = _create_xmp_files( destination_file_manifests, program_options )
-#    print( "\tDone")
-#    perf_timer.add_perf_timing(  'Generating geotagged XMP files', xmp_generation_results['operation_time_seconds'])
+    checksum_manager = checksum_mgr.ChecksumManager(len(source_image_info['source_file_dict']) *
+                                                    (1 + len(program_options['sourcedirs']['additional']) +
+                                                     len(program_options['destination_folders'])),
+                                                    display_console_messages_queue,
+                                                    program_options['checksum_queue_length'],
+                                                    program_options['checksum_processes'])
 
-    # Pull geotags out of XMP and store in manifest
-#    print( "\nUpdating manifest with geotag and XMP hash data")
-#    geotag_and_timestamp_manifest_update_results = _update_manifest_with_geotags( program_options,
-#                                                                                  destination_file_manifests )
-#    print( "\tDone" )
-#    perf_timer.add_perf_timing( "Adding geotags and XMP file hashes to manifest", geotag_and_timestamp_manifest_update_results['operation_time_seconds'])
+    time_start = time.perf_counter()
 
-    # Create (or update) daily manifest files
-    print( "\nWriting or updating per-day manifest files" )
-    manifest_write_results = _write_manifest_files( program_options, destination_file_manifests )
-    print( "\tDone")
-    perf_timer.add_perf_timing( "Writing per-day manifest files to disk",
-                                manifest_write_results['operation_time_seconds'] )
+    # Launch destination writers
+    destination_writers = _launch_destination_writers( program_options, display_console_messages_queue,
+                                                       checksum_manager.checksum_update_queue)
 
-    # Copy from laptop to external storage
-    external_copies_time_seconds = _copy_files_to_external_storage( program_options, source_file_manifest )
-    perf_timer.add_perf_timing( 'Copying all files from laptop to all travel storage media devices',
-                                 external_copies_time_seconds )
+    # Launch sourcedir readers
+    sourcedir_readers = _launch_sourcedir_readers( program_options, source_image_info,
+                                                   display_console_messages_queue,
+                                                   destination_writers,
+                                                   checksum_manager.checksum_update_queue)
 
-    # Validate external storage copies
-    print( "\nVerifying all travel media copies")
-    travel_media_verify_time_seconds = _verify_travel_media_copies( program_options, destination_file_manifests )
-    print( "\tDone")
-    perf_timer.add_perf_timing( "Verifying all travel media copies match original hashes",
-                                travel_media_verify_time_seconds )
+    print( "\nStarting combination file copy/checksum computation operations")
 
-    # Final perf print
-    print( "" )
-    perf_timer.display_performance()
+    # Read out all messages from the display queue
+    blocking_read = True
+    read_timeout_seconds = 0.05
+    try:
+        #print( "\n\n")
+        while True:
+            process_started_msg = display_console_messages_queue.get(blocking_read, read_timeout_seconds)
 
+            # TODO: maybe move this to its own process and do something useful, but for now, politely ignore
+            #print( f"Parent got message to display: \"{process_started_msg['msg']}\"")
+    except queue.Empty:
+        pass
+
+    # Now let's wait for checksum data to come in
+    number_unique_files = len(source_image_info['source_file_dict'])
+    number_copies_of_unique_files = 1 + len(program_options['sourcedirs']['additional']) + len(program_options['destination_folders'])
+
+    checksum_manager.validate_all_checksums_match( number_unique_files, number_copies_of_unique_files )
+    time_end = time.perf_counter()
+    time_copy_checksum_seconds = time_end - time_start
+    perftimer.add_perf_timing( "Copy/checksum all files, validate checksums", time_copy_checksum_seconds)
+
+
+    # Now clean up the reader/writer processes
+
+    while len(sourcedir_readers) > 0:
+        curr_reader_handle = sourcedir_readers.pop()
+        #print( "Parent waiting for sourcedir reader child process to rejoin")
+        curr_reader_handle.join()
+        curr_reader_handle.close()
+        #print( "Parent had sourcedir reader child process rejoin")
+
+    while len(destination_writers['writer_process_handles']) > 0:
+        curr_handle = destination_writers['writer_process_handles'].pop()
+        #print( "Parent waiting for destination writer child process to rejoin" )
+        curr_handle.join()
+        curr_handle.close()
+        #print( "Parent had destination writer child process rejoin")
+
+    #print( "parent terminating cleanly" )
+
+    _print_io_stats( source_image_info, time_copy_checksum_seconds, number_copies_of_unique_files,
+                     len(program_options['destination_folders']) )
+
+    print( "")
+    perftimer.display_performance()
 
 if __name__ == "__main__":
     _main()
